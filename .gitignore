@@ -1,0 +1,7 @@
+/target/
+*.pdb
+*.log
+.env
+.DS_Store
+Thumbs.db
+cameras.toml

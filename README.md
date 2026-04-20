@@ -28,6 +28,7 @@ cargo run -- --advertise-host 192.168.1.50
 ```
 
 Replace `192.168.1.50` with the IP address that your NVR can reach.
+Press `Ctrl+C` to stop the emulator and shut down the managed `ffmpeg` encoder processes.
 
 By default the emulator uses:
 

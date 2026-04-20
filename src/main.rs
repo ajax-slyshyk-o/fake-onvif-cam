@@ -11,12 +11,17 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 
-fn main() {
+enum RuntimeEvent {
+    ShutdownRequested,
+    Fatal(String),
+}
+
+fn main() -> process::ExitCode {
     let configs = match config::load_from_env() {
         Ok(configs) => configs,
         Err(err) => {
             eprintln!("error: {err}");
-            process::exit(2);
+            return process::ExitCode::from(2);
         }
     };
     let configs: Vec<_> = configs.into_iter().map(Arc::new).collect();
@@ -37,7 +42,15 @@ fn main() {
         }
     }
 
-    let (fatal_tx, fatal_rx) = mpsc::channel();
+    let (event_tx, event_rx) = mpsc::channel();
+    let ctrlc_tx = event_tx.clone();
+    if let Err(err) = ctrlc::set_handler(move || {
+        let _ = ctrlc_tx.send(RuntimeEvent::ShutdownRequested);
+    }) {
+        eprintln!("failed to install Ctrl+C handler: {err}");
+        return process::ExitCode::FAILURE;
+    }
+
     let mut rtsp_servers = Vec::new();
     let mut ffmpeg_processes = Vec::new();
     let mut http_threads = Vec::new();
@@ -63,7 +76,7 @@ fn main() {
                     "failed to start rtsp service for {}: {err}",
                     config.camera_name
                 );
-                process::exit(1);
+                return process::ExitCode::FAILURE;
             }
         }
 
@@ -72,18 +85,20 @@ fn main() {
             Err(err) => {
                 eprintln!("failed to start ffmpeg for {}: {err}", config.camera_name);
                 eprintln!("start with --no-ffmpeg if you only want the ONVIF endpoints");
-                process::exit(1);
+                return process::ExitCode::FAILURE;
             }
         }
 
         let http_config = config.clone();
         let camera_name = config.camera_name.clone();
-        let fatal_tx = fatal_tx.clone();
+        let event_tx = event_tx.clone();
         match thread::Builder::new()
             .name(format!("onvif-http-{}", camera_name))
             .spawn(move || {
                 if let Err(err) = http::serve(http_config) {
-                    let _ = fatal_tx.send(format!("http service for {camera_name} failed: {err}"));
+                    let _ = event_tx.send(RuntimeEvent::Fatal(format!(
+                        "http service for {camera_name} failed: {err}"
+                    )));
                 }
             }) {
             Ok(thread) => http_threads.push(thread),
@@ -92,15 +107,22 @@ fn main() {
                     "failed to start http service for {}: {err}",
                     config.camera_name
                 );
-                process::exit(1);
+                return process::ExitCode::FAILURE;
             }
         }
     }
 
-    drop(fatal_tx);
+    drop(event_tx);
 
-    if let Ok(message) = fatal_rx.recv() {
-        eprintln!("{message}");
-        process::exit(1);
+    match event_rx.recv() {
+        Ok(RuntimeEvent::ShutdownRequested) => {
+            println!("Ctrl+C received, shutting down");
+            process::ExitCode::SUCCESS
+        }
+        Ok(RuntimeEvent::Fatal(message)) => {
+            eprintln!("{message}");
+            process::ExitCode::FAILURE
+        }
+        Err(_) => process::ExitCode::SUCCESS,
     }
 }

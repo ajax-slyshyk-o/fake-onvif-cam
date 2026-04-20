@@ -26,7 +26,7 @@ fn main() -> process::ExitCode {
     };
     let configs: Vec<_> = configs.into_iter().map(Arc::new).collect();
 
-    println!("fake-onvif-cam {}", env!("CARGO_PKG_VERSION"));
+    println!("fake-onvif-cam {}", config::app_version());
     println!("cameras: {}", configs.len());
 
     let discovery_configs: Vec<_> = configs

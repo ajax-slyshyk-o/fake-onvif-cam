@@ -2,8 +2,7 @@
 
 SET CURRENT_DIR=%cd%
 
-cd %~dp0target\release
-fake-onvif-cam.exe --config ..\..\cameras.toml || goto :error
+"%~dp0target\release\fake-onvif-cam.exe" --config "%~dp0cameras.toml" || goto :error
 
 :ok
 cd "%CURRENT_DIR%"

@@ -6,6 +6,19 @@ use std::fs;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 
+const __VERSION: &str = concat!("\0", "Ver.:", env!("_GIT_VERSION"), "\0");
+const _VERSION: &str = env!("_GIT_VERSION");
+
+pub(crate) fn app_version() -> String {
+    __VERSION
+        .trim_matches('\0')
+        .strip_prefix("Ver.:")
+        .unwrap_or(_VERSION)
+        .to_string()
+}
+
+static APP_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(app_version);
+
 #[derive(Clone, Debug)]
 pub enum MediaInput {
     TestPattern,
@@ -38,7 +51,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Parser)]
-#[command(version, about, long_about = None)]
+#[command(version = APP_VERSION.as_str(), about, long_about = None)]
 struct Cli {
     /// TOML config file containing one or more fake cameras.
     #[arg(long = "config")]

@@ -24,7 +24,28 @@ fn main() -> process::ExitCode {
             return process::ExitCode::from(2);
         }
     };
-    let configs: Vec<_> = configs.into_iter().map(Arc::new).collect();
+
+    let configs: Vec<_> = configs
+        .into_iter()
+        .map(|mut cfg| {
+            if let config::MediaInput::File(ref path) = cfg.media_input.clone() {
+                if !cfg.no_ffmpeg {
+                    match ffmpeg::probe_file(&cfg.ffmpeg_path, path) {
+                        Ok((w, h, fps)) => {
+                            cfg.width = w;
+                            cfg.height = h;
+                            cfg.fps = fps;
+                        }
+                        Err(err) => eprintln!(
+                            "warning: could not probe {}: {err}; using config dimensions",
+                            path.display()
+                        ),
+                    }
+                }
+            }
+            Arc::new(cfg)
+        })
+        .collect();
 
     println!("fake-onvif-cam {}", config::app_version());
     println!("cameras: {}", configs.len());
@@ -62,6 +83,19 @@ fn main() -> process::ExitCode {
         println!("device service: {}", onvif::device_xaddr(config));
         println!("media service: {}", onvif::media_xaddr(config));
         println!("rtsp stream: {}", onvif::rtsp_uri(config));
+        match &config.media_input {
+            config::MediaInput::File(path) => println!(
+                "video: {}x{} @ {}fps  file: {}",
+                config.width,
+                config.height,
+                config.fps,
+                path.display()
+            ),
+            config::MediaInput::TestPattern => println!(
+                "video: {}x{} @ {}fps  test pattern",
+                config.width, config.height, config.fps
+            ),
+        }
 
         match rtsp::spawn(config.clone()) {
             Ok(server) => {

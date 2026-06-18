@@ -1,10 +1,100 @@
 use crate::config::{Config, MediaInput};
 use std::io;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+/// Probe the first video stream of `file` and return `(width, height, fps)`.
+/// `fps` is rounded to the nearest integer from the ffprobe rational (e.g. 30000/1001 → 30).
+pub fn probe_file(ffmpeg_path: &Path, file: &Path) -> Result<(u32, u32, u32), String> {
+    let probe = ffprobe_path(ffmpeg_path);
+    let output = Command::new(&probe)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,r_frame_rate",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(file)
+        .output()
+        .map_err(|e| format!("ffprobe failed to run: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "ffprobe exited with {}: {stderr}",
+            output.status
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.lines().next().unwrap_or("").trim();
+    let parts: Vec<&str> = line.split(',').collect();
+    if parts.len() != 3 {
+        return Err(format!("unexpected ffprobe output: {line}"));
+    }
+
+    let width = parts[0]
+        .parse::<u32>()
+        .map_err(|_| format!("bad width from ffprobe: {}", parts[0]))?;
+    let height = parts[1]
+        .parse::<u32>()
+        .map_err(|_| format!("bad height from ffprobe: {}", parts[1]))?;
+    let fps = parse_fps_rational(parts[2])?;
+
+    if width == 0 || height == 0 {
+        return Err(format!("ffprobe returned zero dimensions: {width}x{height}"));
+    }
+
+    Ok((width, height, fps))
+}
+
+fn ffprobe_path(ffmpeg_path: &Path) -> std::path::PathBuf {
+    let name = ffmpeg_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("ffprobe");
+    let probe_name = name.replace("ffmpeg", "ffprobe");
+    if probe_name == name {
+        ffmpeg_path.with_file_name("ffprobe")
+    } else {
+        ffmpeg_path.with_file_name(probe_name)
+    }
+}
+
+fn parse_fps_rational(s: &str) -> Result<u32, String> {
+    let (num, den) = if let Some((n, d)) = s.split_once('/') {
+        let num = n
+            .parse::<u64>()
+            .map_err(|_| format!("bad fps numerator: {n}"))?;
+        let den = d
+            .parse::<u64>()
+            .map_err(|_| format!("bad fps denominator: {d}"))?;
+        (num, den)
+    } else {
+        (
+            s.parse::<u64>().map_err(|_| format!("bad fps: {s}"))?,
+            1,
+        )
+    };
+
+    if den == 0 {
+        return Err("fps denominator is zero".to_string());
+    }
+
+    let fps = ((num + den / 2) / den) as u32;
+    if fps == 0 {
+        return Err("fps is zero".to_string());
+    }
+    Ok(fps)
+}
 
 pub struct FfmpegGuard {
     stop: Arc<AtomicBool>,

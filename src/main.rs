@@ -29,7 +29,7 @@ fn main() -> process::ExitCode {
         .into_iter()
         .map(|mut cfg| {
             if let config::MediaInput::File(ref path) = cfg.media_input.clone() {
-                if !cfg.no_ffmpeg {
+                if !cfg.no_ffmpeg && !cfg.scale {
                     match ffmpeg::probe_file(&cfg.ffmpeg_path, path) {
                         Ok((w, h, fps)) => {
                             cfg.width = w;
@@ -85,11 +85,12 @@ fn main() -> process::ExitCode {
         println!("rtsp stream: {}", onvif::rtsp_uri(config));
         match &config.media_input {
             config::MediaInput::File(path) => println!(
-                "video: {}x{} @ {}fps  file: {}",
+                "video: {}x{} @ {}fps  file: {}{}",
                 config.width,
                 config.height,
                 config.fps,
-                path.display()
+                path.display(),
+                if config.scale { "  (scaled)" } else { "" }
             ),
             config::MediaInput::TestPattern => println!(
                 "video: {}x{} @ {}fps  test pattern",

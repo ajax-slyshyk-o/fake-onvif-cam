@@ -46,6 +46,7 @@ pub struct Config {
     pub overlay_text: Option<String>,
     pub overlay_font: Option<PathBuf>,
     pub overlay_font_size: u32,
+    pub scale: bool,
     pub no_ffmpeg: bool,
     pub no_discovery: bool,
 }
@@ -141,6 +142,11 @@ struct Cli {
     #[arg(long = "no-overlay")]
     no_overlay: bool,
 
+    /// Scale and re-rate the video stream to the configured width, height, and fps.
+    /// Has no effect for test patterns (they already use the configured size).
+    #[arg(long = "scale")]
+    scale: bool,
+
     /// Do not launch ffmpeg.
     #[arg(long = "no-ffmpeg")]
     no_ffmpeg: bool,
@@ -180,6 +186,7 @@ struct TomlCamera {
     overlay_font: Option<PathBuf>,
     overlay_font_size: Option<u32>,
     no_overlay: Option<bool>,
+    scale: Option<bool>,
     no_ffmpeg: Option<bool>,
     no_discovery: Option<bool>,
 }
@@ -231,6 +238,7 @@ impl From<Cli> for Config {
                 cli.overlay_font.or_else(default_overlay_font)
             },
             overlay_font_size: cli.overlay_font_size,
+            scale: cli.scale,
             no_ffmpeg: cli.no_ffmpeg,
             no_discovery: cli.no_discovery,
         }
@@ -346,6 +354,7 @@ fn camera_from_toml(
             "overlay_font_size",
             index,
         )?,
+        scale: choose_copy(&camera.scale, &defaults.scale, false),
         no_ffmpeg: choose_copy(&camera.no_ffmpeg, &defaults.no_ffmpeg, false),
         no_discovery: choose_copy(&camera.no_discovery, &defaults.no_discovery, false),
     })
@@ -375,6 +384,7 @@ impl Default for Config {
             overlay_text: Some("Fake ONVIF Camera".to_string()),
             overlay_font: default_overlay_font(),
             overlay_font_size: 32,
+            scale: false,
             no_ffmpeg: false,
             no_discovery: false,
         }

@@ -216,12 +216,25 @@ fn spawn_child(config: &Config) -> io::Result<Child> {
         }
     }
 
+    let mut vfilters: Vec<String> = Vec::new();
+
+    if config.scale {
+        if matches!(config.media_input, MediaInput::File(_)) {
+            vfilters.push(format!("scale={}:{}", config.width, config.height));
+            vfilters.push(format!("fps={}", config.fps));
+        }
+    }
+
     if let Some(text) = &config.overlay_text {
-        command.arg("-vf").arg(drawtext_filter(
+        vfilters.push(drawtext_filter(
             text,
             config.overlay_font.as_deref(),
             config.overlay_font_size,
         ));
+    }
+
+    if !vfilters.is_empty() {
+        command.arg("-vf").arg(vfilters.join(","));
     }
 
     let keyframe_interval = config.fps.to_string();

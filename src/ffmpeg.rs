@@ -121,10 +121,9 @@ pub fn start(config: &Config) -> io::Result<Option<FfmpegGuard>> {
     thread::sleep(Duration::from_millis(250));
 
     if let Some(status) = child.try_wait()? {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("ffmpeg exited immediately with status {status}"),
-        ));
+        return Err(io::Error::other(format!(
+            "ffmpeg exited immediately with status {status}"
+        )));
     }
 
     println!(
@@ -218,11 +217,9 @@ fn spawn_child(config: &Config) -> io::Result<Child> {
 
     let mut vfilters: Vec<String> = Vec::new();
 
-    if config.scale {
-        if matches!(config.media_input, MediaInput::File(_)) {
-            vfilters.push(format!("scale={}:{}", config.width, config.height));
-            vfilters.push(format!("fps={}", config.fps));
-        }
+    if config.scale && matches!(config.media_input, MediaInput::File(_)) {
+        vfilters.push(format!("scale={}:{}", config.width, config.height));
+        vfilters.push(format!("fps={}", config.fps));
     }
 
     if let Some(text) = &config.overlay_text {

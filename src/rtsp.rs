@@ -85,30 +85,24 @@ pub fn spawn(config: Arc<Config>) -> io::Result<RtspServerGuard> {
 
     let clients = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
-    let mut workers = Vec::new();
-
-    workers.push(spawn_accept_loop(
-        listener,
-        config.clone(),
-        clients.clone(),
-        rtp_socket.clone(),
-        rtcp_socket.clone(),
-        stop.clone(),
-    )?);
-    workers.push(spawn_relay_loop(
-        "rtp-relay",
-        rtp_socket.clone(),
-        clients.clone(),
-        stop.clone(),
-        false,
-    )?);
-    workers.push(spawn_relay_loop(
-        "rtcp-relay",
-        rtcp_socket,
-        clients,
-        stop.clone(),
-        true,
-    )?);
+    let workers = vec![
+        spawn_accept_loop(
+            listener,
+            config.clone(),
+            clients.clone(),
+            rtp_socket.clone(),
+            rtcp_socket.clone(),
+            stop.clone(),
+        )?,
+        spawn_relay_loop(
+            "rtp-relay",
+            rtp_socket.clone(),
+            clients.clone(),
+            stop.clone(),
+            false,
+        )?,
+        spawn_relay_loop("rtcp-relay", rtcp_socket, clients, stop.clone(), true)?,
+    ];
 
     Ok(RtspServerGuard { stop, workers })
 }
@@ -270,11 +264,7 @@ fn handle_client(
     let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
     let playing = Arc::new(AtomicBool::new(false));
 
-    loop {
-        let request = match read_request(&mut reader)? {
-            Some(request) => request,
-            None => break,
-        };
+    while let Some(request) = read_request(&mut reader)? {
         let cseq = request.cseq();
 
         match request.method.as_str() {
@@ -542,7 +532,7 @@ fn write_interleaved(writer: &Arc<Mutex<TcpStream>>, channel: u8, packet: &[u8])
 fn lock_stream(writer: &Arc<Mutex<TcpStream>>) -> io::Result<std::sync::MutexGuard<'_, TcpStream>> {
     writer
         .lock()
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "RTSP stream lock poisoned"))
+        .map_err(|_| io::Error::other("RTSP stream lock poisoned"))
 }
 
 fn replace_client(clients: &Clients, client: Client) {

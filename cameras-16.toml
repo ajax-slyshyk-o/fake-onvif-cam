@@ -1,0 +1,172 @@
+[defaults]
+advertise_host = "10.42.0.44"
+ffmpeg = "d:/bin/ffmpeg-8.1-full_build/bin/ffmpeg.exe"
+# Fallback media file. A camera can override this with its own file entry.
+file = "d:/Projects/AJAX/video/Kyiv1080.mp4"
+width = 1920
+height = 1080
+fps = 30
+scale = true
+manufacturer = "Codex Labs"
+model = "FakeCam Rust"
+overlay_font_size = 32
+
+[[cameras]]
+name = "Fake Camera 01"
+uuid = "00000000-0000-4550-98a8-98a80cab1b88"
+http = "0.0.0.0:8000"
+rtsp_port = 8554
+rtsp_path = "live"
+rtp_port = 5004
+serial = "FAKE-ONVIF-001"
+overlay_text = "Fake Camera 01"
+
+[[cameras]]
+name = "Fake Camera 02"
+uuid = "00000000-0000-4550-98a8-98a80cab1b89"
+http = "0.0.0.0:8001"
+rtsp_port = 8555
+rtsp_path = "live"
+rtp_port = 5006
+serial = "FAKE-ONVIF-002"
+overlay_text = "Fake Camera 02"
+
+[[cameras]]
+name = "Fake Camera 03"
+uuid = "00000000-0000-4550-98a8-98a80cab1b8a"
+http = "0.0.0.0:8002"
+rtsp_port = 8556
+rtsp_path = "live"
+rtp_port = 5008
+serial = "FAKE-ONVIF-003"
+overlay_text = "Fake Camera 03"
+
+[[cameras]]
+name = "Fake Camera 04"
+uuid = "00000000-0000-4550-98a8-98a80cab1b8b"
+http = "0.0.0.0:8003"
+rtsp_port = 8557
+rtsp_path = "live"
+rtp_port = 5010
+serial = "FAKE-ONVIF-004"
+overlay_text = "Fake Camera 04"
+
+[[cameras]]
+name = "Fake Camera 05"
+uuid = "00000000-0000-4550-98a8-98a80cab1b8c"
+http = "0.0.0.0:8004"
+rtsp_port = 8558
+rtsp_path = "live"
+rtp_port = 5012
+serial = "FAKE-ONVIF-005"
+overlay_text = "Fake Camera 05"
+
+[[cameras]]
+name = "Fake Camera 06"
+uuid = "00000000-0000-4550-98a8-98a80cab1b8d"
+http = "0.0.0.0:8005"
+rtsp_port = 8559
+rtsp_path = "live"
+rtp_port = 5014
+serial = "FAKE-ONVIF-006"
+overlay_text = "Fake Camera 06"
+
+[[cameras]]
+name = "Fake Camera 07"
+uuid = "00000000-0000-4550-98a8-98a80cab1b8e"
+http = "0.0.0.0:8006"
+rtsp_port = 8560
+rtsp_path = "live"
+rtp_port = 5016
+serial = "FAKE-ONVIF-007"
+overlay_text = "Fake Camera 07"
+
+[[cameras]]
+name = "Fake Camera 08"
+uuid = "00000000-0000-4550-98a8-98a80cab1b8f"
+http = "0.0.0.0:8007"
+rtsp_port = 8561
+rtsp_path = "live"
+rtp_port = 5018
+serial = "FAKE-ONVIF-008"
+overlay_text = "Fake Camera 08"
+
+[[cameras]]
+name = "Fake Camera 09"
+uuid = "00000000-0000-4550-98a8-98a80cab1b90"
+http = "0.0.0.0:8008"
+rtsp_port = 8562
+rtsp_path = "live"
+rtp_port = 5020
+serial = "FAKE-ONVIF-009"
+overlay_text = "Fake Camera 09"
+
+[[cameras]]
+name = "Fake Camera 10"
+uuid = "00000000-0000-4550-98a8-98a80cab1b91"
+http = "0.0.0.0:8009"
+rtsp_port = 8563
+rtsp_path = "live"
+rtp_port = 5022
+serial = "FAKE-ONVIF-010"
+overlay_text = "Fake Camera 10"
+
+[[cameras]]
+name = "Fake Camera 11"
+uuid = "00000000-0000-4550-98a8-98a80cab1b92"
+http = "0.0.0.0:8010"
+rtsp_port = 8564
+rtsp_path = "live"
+rtp_port = 5024
+serial = "FAKE-ONVIF-011"
+overlay_text = "Fake Camera 11"
+
+[[cameras]]
+name = "Fake Camera 12"
+uuid = "00000000-0000-4550-98a8-98a80cab1b93"
+http = "0.0.0.0:8011"
+rtsp_port = 8565
+rtsp_path = "live"
+rtp_port = 5026
+serial = "FAKE-ONVIF-012"
+overlay_text = "Fake Camera 12"
+
+[[cameras]]
+name = "Fake Camera 13"
+uuid = "00000000-0000-4550-98a8-98a80cab1b94"
+http = "0.0.0.0:8012"
+rtsp_port = 8566
+rtsp_path = "live"
+rtp_port = 5028
+serial = "FAKE-ONVIF-013"
+overlay_text = "Fake Camera 13"
+
+[[cameras]]
+name = "Fake Camera 14"
+uuid = "00000000-0000-4550-98a8-98a80cab1b95"
+http = "0.0.0.0:8013"
+rtsp_port = 8567
+rtsp_path = "live"
+rtp_port = 5030
+serial = "FAKE-ONVIF-014"
+overlay_text = "Fake Camera 14"
+
+[[cameras]]
+name = "Fake Camera 15"
+uuid = "00000000-0000-4550-98a8-98a80cab1b96"
+http = "0.0.0.0:8014"
+rtsp_port = 8568
+rtsp_path = "live"
+rtp_port = 5032
+serial = "FAKE-ONVIF-015"
+overlay_text = "Fake Camera 15"
+
+[[cameras]]
+name = "Fake Camera 16"
+uuid = "00000000-0000-4550-98a8-98a80cab1b97"
+http = "0.0.0.0:8015"
+rtsp_port = 8569
+rtsp_path = "live"
+rtp_port = 5034
+serial = "FAKE-ONVIF-016"
+overlay_text = "Fake Camera 16"

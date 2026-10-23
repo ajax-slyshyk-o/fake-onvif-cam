@@ -237,20 +237,9 @@ fn spawn_child(config: &Config) -> io::Result<Child> {
     let keyframe_interval = config.fps.to_string();
     let bitrate = format!("{}k", config.bitrate_kbps);
     let bufsize = format!("{}k", config.bitrate_kbps.saturating_mul(2));
+    command.arg("-an");
+    add_encoder_args(&mut command, config);
     command
-        .arg("-an")
-        .arg("-c:v")
-        .arg("libx264")
-        .arg("-profile:v")
-        .arg("baseline")
-        .arg("-preset")
-        .arg("veryfast")
-        .arg("-tune")
-        .arg("zerolatency")
-        .arg("-x264-params")
-        .arg("repeat-headers=1")
-        .arg("-pix_fmt")
-        .arg("yuv420p")
         .arg("-bf")
         .arg("0")
         .arg("-b:v")
@@ -273,6 +262,78 @@ fn spawn_child(config: &Config) -> io::Result<Child> {
         .stderr(Stdio::inherit());
 
     command.spawn()
+}
+
+/// Encoder-specific arguments. The RTSP SDP carries no sprop-parameter-sets, so every
+/// encoder must repeat SPS/PPS in-band on keyframes.
+fn add_encoder_args(command: &mut Command, config: &Config) {
+    let codec = config.codec.as_str();
+    let preset = config.preset.as_deref();
+
+    command.arg("-c:v").arg(codec);
+
+    match codec {
+        "libx264" => {
+            command
+                .arg("-profile:v")
+                .arg("baseline")
+                .arg("-preset")
+                .arg(preset.unwrap_or("veryfast"))
+                .arg("-tune")
+                .arg("zerolatency")
+                .arg("-x264-params")
+                .arg("repeat-headers=1")
+                .arg("-pix_fmt")
+                .arg("yuv420p");
+        }
+        "h264_nvenc" => {
+            command
+                .arg("-profile:v")
+                .arg("baseline")
+                .arg("-preset")
+                .arg(preset.unwrap_or("p2"))
+                .arg("-tune")
+                .arg("ll")
+                .arg("-pix_fmt")
+                .arg("yuv420p")
+                .arg("-bsf:v")
+                .arg("dump_extra=freq=keyframe");
+        }
+        "h264_qsv" => {
+            command
+                .arg("-profile:v")
+                .arg("baseline")
+                .arg("-preset")
+                .arg(preset.unwrap_or("veryfast"))
+                .arg("-pix_fmt")
+                .arg("nv12")
+                .arg("-bsf:v")
+                .arg("dump_extra=freq=keyframe");
+        }
+        "h264_amf" => {
+            command
+                .arg("-usage")
+                .arg("lowlatency")
+                .arg("-quality")
+                .arg(preset.unwrap_or("speed"))
+                .arg("-profile:v")
+                .arg("constrained_baseline")
+                .arg("-pix_fmt")
+                .arg("yuv420p")
+                .arg("-bsf:v")
+                .arg("dump_extra=freq=keyframe");
+        }
+        _ => {
+            if let Some(preset) = preset {
+                command.arg("-preset").arg(preset);
+            }
+            command
+                .arg("-pix_fmt")
+                .arg("yuv420p")
+                .arg("-bsf:v")
+                .arg("dump_extra=freq=keyframe");
+        }
+    }
 }
 
 fn drawtext_filter(text: &str, font: Option<&std::path::Path>, font_size: u32) -> String {

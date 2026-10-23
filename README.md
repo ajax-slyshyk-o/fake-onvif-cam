@@ -10,6 +10,7 @@ The emulator is written in Rust and uses an external `ffmpeg` binary for media. 
 - Serves basic ONVIF Device and Media SOAP endpoints.
 - Returns one H.264 RTSP stream URI from `GetStreamUri`.
 - Starts `ffmpeg` as an H.264 RTP encoder using either a generated test pattern or a media file.
+- Lets you choose the video bitrate, the encoder (software x264 or NVENC/QSV/AMF hardware) and its preset.
 - Probes media files with `ffprobe` at startup and reports accurate resolution and frame rate in ONVIF metadata.
 - Serves RTSP from Rust and relays ffmpeg RTP packets to RTSP clients.
 - Restarts `ffmpeg` if the external encoder process exits.
@@ -62,6 +63,30 @@ cargo run -- --advertise-host 192.168.1.50 --file 4k_clip.mp4 --width 1920 --hei
 When `--scale` is active, ONVIF metadata advertises the configured target dimensions, not the source file's native dimensions.
 When `--scale` is not set, `width`/`height`/`fps` are only used for the generated test pattern; for file input the real dimensions are probed and used.
 
+`--scale` works in both directions: use it to upscale a Full HD file to 4K as well as to downscale a large file. The scale filter does not preserve the aspect ratio, so keep the target in the same ratio as the source. Upscaling adds no detail, and the output bitrate is not changed by `--scale` (see below).
+
+## Bitrate, codec and preset
+
+The encoder settings are independent of `--scale`:
+
+- `--bitrate <kbit/s>` (`bitrate` in TOML) sets the target video bitrate. Default: `2500`. It is passed to ffmpeg as `-b:v` and `-maxrate`, with `-bufsize` at twice the value. Raise it together with the resolution or frame rate, for example about `16000` for 4K, otherwise the picture looks blocky. Resolution and fps do not change the bandwidth by themselves; the stream stays close to the configured bitrate (or below it for simple content).
+- `--codec <encoder>` (`codec` in TOML) selects the ffmpeg H.264 encoder. Default: `libx264`.
+- `--preset <name>` (`preset` in TOML) selects the encoder preset. If omitted, a fast default for the chosen codec is used.
+
+| Codec | Runs on | Default preset | Notes |
+|-------|---------|----------------|-------|
+| `libx264` | CPU | `veryfast` | Use `ultrafast` to cut CPU load further. |
+| `h264_nvenc` | NVIDIA GPU | `p2` | Presets `p1` (fastest) to `p7`. Consumer GPUs limit the number of simultaneous NVENC sessions (depends on the driver). |
+| `h264_qsv` | Intel GPU | `veryfast` | Needs the Intel iGPU to be enabled. |
+| `h264_amf` | AMD GPU | `speed` | `-quality` is set from the preset: `speed`, `balanced` or `quality`. |
+| other | | none | `--preset` is passed through if set. |
+
+The RTSP SDP carries no `sprop-parameter-sets`, so every encoder is configured to repeat SPS/PPS in the stream on each keyframe. Make sure the chosen encoder exists in your ffmpeg build (`ffmpeg -encoders`).
+
+```powershell
+cargo run -- --advertise-host 192.168.1.50 --file clip.mp4 --codec h264_nvenc --bitrate 8000
+```
+
 ## Run Multiple Cameras
 
 Create a TOML config with one `[[cameras]]` table per fake camera:
@@ -110,6 +135,18 @@ Each camera can set its own `file`. If omitted, it uses `[defaults].file`; if bo
 
 All options available on the command line can also be set in the TOML `[defaults]` block or per `[[cameras]]` entry.
 
+### CPU load with many cameras
+
+Every camera runs its own ffmpeg encode, so the load grows linearly with the camera count. Sixteen 1080p30 `libx264 veryfast` streams can saturate a desktop CPU, and 4K is about four times heavier per stream. To reduce it, lower the resolution and fps (with `scale = true`), use `preset = "ultrafast"`, or move cameras to a hardware encoder. `codec` and `preset` can be set per camera, so encoders can be mixed.
+
+Ready-made examples in the repository:
+
+| File | Contents |
+|------|----------|
+| `cameras-8.toml` | 8 cameras, `libx264` |
+| `cameras-16.toml` | 16 cameras, `libx264` |
+| `cameras-16-hw.toml` | 16 cameras at 4000 kbit/s: 01-08 on `h264_nvenc` (GPU), 09-16 on `libx264 ultrafast` (CPU), to stay under the NVENC session limit |
+
 ## Useful options
 
 ```text
@@ -127,6 +164,9 @@ All options available on the command line can also be set in the TOML `[defaults
 --height <pixels>         Height for test pattern or scale target. Default: 720
 --fps <fps>               Frame rate for test pattern or scale target. Default: 25
 --scale                   Scale and re-rate the file stream to --width/--height/--fps.
+--bitrate <kbit/s>        Target video bitrate. Default: 2500
+--codec <encoder>         ffmpeg H.264 encoder: libx264, h264_nvenc, h264_qsv, h264_amf, ... Default: libx264
+--preset <name>           Encoder preset. Default depends on the codec (libx264: veryfast, h264_nvenc: p2).
 --overlay-text <text>     Text burned into the video. Default: camera name.
 --overlay-font <path>     Font file used for the overlay. Default: a platform system font.
 --overlay-font-size <px>  Overlay font size. Default: 32

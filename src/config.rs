@@ -40,6 +40,8 @@ pub struct Config {
     pub height: u32,
     pub fps: u32,
     pub bitrate_kbps: u32,
+    pub codec: String,
+    pub preset: Option<String>,
     pub manufacturer: String,
     pub model: String,
     pub firmware: String,
@@ -110,6 +112,15 @@ struct Cli {
     /// Target H.264 video bitrate in kbit/s.
     #[arg(long = "bitrate", default_value_t = 2500, value_parser = parse_non_zero_u32)]
     bitrate_kbps: u32,
+
+    /// ffmpeg H.264 encoder: libx264, h264_nvenc, h264_qsv, h264_amf, ...
+    #[arg(long = "codec", default_value = "libx264")]
+    codec: String,
+
+    /// Encoder preset. Defaults to a fast one suited to the chosen codec
+    /// (libx264/h264_qsv: veryfast, h264_nvenc: p2, h264_amf: speed).
+    #[arg(long = "preset")]
+    preset: Option<String>,
 
     /// Device manufacturer.
     #[arg(long = "manufacturer", default_value = "Codex Labs")]
@@ -188,6 +199,8 @@ struct TomlCamera {
     height: Option<u32>,
     fps: Option<u32>,
     bitrate: Option<u32>,
+    codec: Option<String>,
+    preset: Option<String>,
     manufacturer: Option<String>,
     model: Option<String>,
     firmware: Option<String>,
@@ -255,6 +268,8 @@ impl From<Cli> for Config {
             height: cli.height,
             fps: cli.fps,
             bitrate_kbps: cli.bitrate_kbps,
+            codec: cli.codec,
+            preset: cli.preset,
             manufacturer: cli.manufacturer,
             model: cli.model,
             firmware: cli.firmware,
@@ -373,6 +388,8 @@ fn camera_from_toml(
         height,
         fps,
         bitrate_kbps,
+        codec: choose_string(&camera.codec, &defaults.codec, "libx264"),
+        preset: choose_optional_string(&camera.preset, &defaults.preset),
         manufacturer: choose_string(&camera.manufacturer, &defaults.manufacturer, "Codex Labs"),
         model: choose_string(&camera.model, &defaults.model, "FakeCam Rust"),
         firmware: choose_string(
@@ -412,6 +429,8 @@ impl Default for Config {
             height: 720,
             fps: 25,
             bitrate_kbps: 2500,
+            codec: "libx264".to_string(),
+            preset: None,
             manufacturer: "Codex Labs".to_string(),
             model: "FakeCam Rust".to_string(),
             firmware: env!("CARGO_PKG_VERSION").to_string(),

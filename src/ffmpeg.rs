@@ -238,6 +238,8 @@ fn spawn_child(config: &Config) -> io::Result<Child> {
     }
 
     let keyframe_interval = config.fps.to_string();
+    let bitrate = format!("{}k", config.bitrate_kbps);
+    let bufsize = format!("{}k", config.bitrate_kbps.saturating_mul(2));
     command
         .arg("-an")
         .arg("-c:v")
@@ -255,11 +257,11 @@ fn spawn_child(config: &Config) -> io::Result<Child> {
         .arg("-bf")
         .arg("0")
         .arg("-b:v")
-        .arg("2500k")
+        .arg(&bitrate)
         .arg("-maxrate")
-        .arg("2500k")
+        .arg(&bitrate)
         .arg("-bufsize")
-        .arg("5000k")
+        .arg(&bufsize)
         .arg("-g")
         .arg(keyframe_interval)
         .arg("-f")

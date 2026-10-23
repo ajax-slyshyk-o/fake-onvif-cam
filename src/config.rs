@@ -39,6 +39,7 @@ pub struct Config {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    pub bitrate_kbps: u32,
     pub manufacturer: String,
     pub model: String,
     pub firmware: String,
@@ -105,6 +106,10 @@ struct Cli {
     /// Test-pattern frame rate.
     #[arg(long = "fps", default_value_t = 25, value_parser = parse_non_zero_u32)]
     fps: u32,
+
+    /// Target H.264 video bitrate in kbit/s.
+    #[arg(long = "bitrate", default_value_t = 2500, value_parser = parse_non_zero_u32)]
+    bitrate_kbps: u32,
 
     /// Device manufacturer.
     #[arg(long = "manufacturer", default_value = "Codex Labs")]
@@ -182,6 +187,7 @@ struct TomlCamera {
     width: Option<u32>,
     height: Option<u32>,
     fps: Option<u32>,
+    bitrate: Option<u32>,
     manufacturer: Option<String>,
     model: Option<String>,
     firmware: Option<String>,
@@ -248,6 +254,7 @@ impl From<Cli> for Config {
             width: cli.width,
             height: cli.height,
             fps: cli.fps,
+            bitrate_kbps: cli.bitrate_kbps,
             manufacturer: cli.manufacturer,
             model: cli.model,
             firmware: cli.firmware,
@@ -330,6 +337,11 @@ fn camera_from_toml(
         index,
     )?;
     let fps = validate_non_zero(choose_copy(&camera.fps, &defaults.fps, 25), "fps", index)?;
+    let bitrate_kbps = validate_non_zero(
+        choose_copy(&camera.bitrate, &defaults.bitrate, 2500),
+        "bitrate",
+        index,
+    )?;
     let media_input = choose_optional_path(&camera.file, &defaults.file)
         .map(|path| MediaInput::File(resolve_config_path(base_dir, path)))
         .unwrap_or(MediaInput::TestPattern);
@@ -360,6 +372,7 @@ fn camera_from_toml(
         width,
         height,
         fps,
+        bitrate_kbps,
         manufacturer: choose_string(&camera.manufacturer, &defaults.manufacturer, "Codex Labs"),
         model: choose_string(&camera.model, &defaults.model, "FakeCam Rust"),
         firmware: choose_string(
@@ -398,6 +411,7 @@ impl Default for Config {
             width: 1280,
             height: 720,
             fps: 25,
+            bitrate_kbps: 2500,
             manufacturer: "Codex Labs".to_string(),
             model: "FakeCam Rust".to_string(),
             firmware: env!("CARGO_PKG_VERSION").to_string(),

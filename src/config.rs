@@ -50,8 +50,152 @@ pub struct Config {
     pub overlay_font: Option<PathBuf>,
     pub overlay_font_size: u32,
     pub scale: bool,
+    pub sub: Option<SubStream>,
     pub no_ffmpeg: bool,
     pub no_discovery: bool,
+}
+
+/// Optional second (sub) stream as configured. Unset dimensions and fps are derived from
+/// the main stream in [`Config::streams`], because the main stream may still be replaced
+/// by the probed file dimensions after the config is loaded.
+#[derive(Clone, Debug)]
+pub struct SubStream {
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub fps: Option<u32>,
+    pub bitrate_kbps: u32,
+    pub rtsp_path: String,
+    pub rtp_port: Option<u16>,
+    pub codec: String,
+    pub preset: Option<String>,
+}
+
+/// A fully resolved stream published by a camera.
+#[derive(Clone, Debug)]
+pub struct Stream {
+    pub name: &'static str,
+    pub rtsp_path: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub bitrate_kbps: u32,
+    pub rtp_port: u16,
+    pub codec: String,
+    pub preset: Option<String>,
+}
+
+const SUB_DEFAULT_HEIGHT: u32 = 240;
+const SUB_DEFAULT_BITRATE_KBPS: u32 = 512;
+const SUB_DEFAULT_RTSP_PATH: &str = "live_sub";
+const SUB_RTP_PORT_OFFSET: u16 = 1000;
+
+impl Config {
+    /// All streams of this camera; the main stream is always first.
+    pub fn streams(&self) -> Vec<Stream> {
+        let mut streams = vec![Stream {
+            name: "main",
+            rtsp_path: self.rtsp_path.clone(),
+            width: self.width,
+            height: self.height,
+            fps: self.fps,
+            bitrate_kbps: self.bitrate_kbps,
+            rtp_port: self.rtp_port,
+            codec: self.codec.clone(),
+            preset: self.preset.clone(),
+        }];
+
+        if let Some(sub) = &self.sub {
+            let (width, height) = sub_dimensions(sub, self.width, self.height);
+            streams.push(Stream {
+                name: "sub",
+                rtsp_path: sub.rtsp_path.clone(),
+                width,
+                height,
+                fps: sub.fps.unwrap_or(self.fps),
+                bitrate_kbps: sub.bitrate_kbps,
+                rtp_port: sub.rtp_port.unwrap_or_else(|| {
+                    self.rtp_port
+                        .checked_add(SUB_RTP_PORT_OFFSET)
+                        .unwrap_or_else(|| self.rtp_port.saturating_sub(SUB_RTP_PORT_OFFSET))
+                }),
+                codec: sub.codec.clone(),
+                preset: sub.preset.clone(),
+            });
+        }
+
+        streams
+    }
+}
+
+/// Sub-stream size: explicit values win, a missing side keeps the main aspect ratio, and with
+/// neither given the sub stream is 240 lines high. Results are even (required by H.264 4:2:0).
+fn sub_dimensions(sub: &SubStream, main_width: u32, main_height: u32) -> (u32, u32) {
+    let scaled = |value: u32, num: u32, den: u32| {
+        (((u64::from(value) * u64::from(num) + u64::from(den) / 2) / u64::from(den)) as u32).max(2)
+    };
+    let (width, height) = match (sub.width, sub.height) {
+        (Some(w), Some(h)) => (w, h),
+        (Some(w), None) => (w, scaled(w, main_height, main_width)),
+        (None, Some(h)) => (scaled(h, main_width, main_height), h),
+        (None, None) => (
+            scaled(SUB_DEFAULT_HEIGHT, main_width, main_height),
+            SUB_DEFAULT_HEIGHT,
+        ),
+    };
+    ((width & !1).max(2), (height & !1).max(2))
+}
+
+/// Raw sub-stream options, shared by the CLI and the TOML parser.
+#[derive(Clone, Debug, Default)]
+struct SubOptions {
+    enabled: bool,
+    width: Option<u32>,
+    height: Option<u32>,
+    fps: Option<u32>,
+    bitrate: Option<u32>,
+    rtsp_path: Option<String>,
+    rtp_port: Option<u16>,
+    codec: Option<String>,
+    preset: Option<String>,
+}
+
+impl SubOptions {
+    fn into_sub_stream(self) -> Result<Option<SubStream>, String> {
+        let any_detail = self.width.is_some()
+            || self.height.is_some()
+            || self.fps.is_some()
+            || self.bitrate.is_some()
+            || self.rtsp_path.is_some()
+            || self.rtp_port.is_some()
+            || self.codec.is_some()
+            || self.preset.is_some();
+        if !self.enabled {
+            return if any_detail {
+                Err("sub_* options require sub_stream = true".to_string())
+            } else {
+                Ok(None)
+            };
+        }
+
+        Ok(Some(SubStream {
+            width: self.width,
+            height: self.height,
+            fps: self.fps,
+            bitrate_kbps: self.bitrate.unwrap_or(SUB_DEFAULT_BITRATE_KBPS),
+            rtsp_path: self
+                .rtsp_path
+                .map(|value| trim_rtsp_path(&value))
+                .unwrap_or_else(|| SUB_DEFAULT_RTSP_PATH.to_string()),
+            rtp_port: self
+                .rtp_port
+                .map(|port| parse_rtp_port(&port.to_string()))
+                .transpose()?,
+            // 240p is cheap in software, and keeps hardware encoder sessions (NVENC has a
+            // per-GPU limit) for the main streams.
+            codec: self.codec.unwrap_or_else(|| "libx264".to_string()),
+            preset: self.preset,
+        }))
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -163,6 +307,42 @@ struct Cli {
     #[arg(long = "scale")]
     scale: bool,
 
+    /// Also publish a low-resolution sub stream (second ONVIF profile and RTSP path).
+    #[arg(long = "sub-stream")]
+    sub_stream: bool,
+
+    /// Sub-stream width. Defaults to the main aspect ratio at 240 lines.
+    #[arg(long = "sub-width", value_parser = parse_non_zero_u32)]
+    sub_width: Option<u32>,
+
+    /// Sub-stream height. Defaults to 240.
+    #[arg(long = "sub-height", value_parser = parse_non_zero_u32)]
+    sub_height: Option<u32>,
+
+    /// Sub-stream frame rate. Defaults to the main frame rate.
+    #[arg(long = "sub-fps", value_parser = parse_non_zero_u32)]
+    sub_fps: Option<u32>,
+
+    /// Sub-stream video bitrate in kbit/s. Defaults to 512.
+    #[arg(long = "sub-bitrate", value_parser = parse_non_zero_u32)]
+    sub_bitrate_kbps: Option<u32>,
+
+    /// Sub-stream RTSP path. Defaults to live_sub.
+    #[arg(long = "sub-rtsp-path")]
+    sub_rtsp_path: Option<String>,
+
+    /// Sub-stream local RTP ingest port (RTCP uses the next port). Defaults to rtp-port + 1000.
+    #[arg(long = "sub-rtp-port", value_parser = parse_rtp_port)]
+    sub_rtp_port: Option<u16>,
+
+    /// Sub-stream encoder. Defaults to libx264.
+    #[arg(long = "sub-codec")]
+    sub_codec: Option<String>,
+
+    /// Sub-stream encoder preset.
+    #[arg(long = "sub-preset")]
+    sub_preset: Option<String>,
+
     /// Do not launch ffmpeg.
     #[arg(long = "no-ffmpeg")]
     no_ffmpeg: bool,
@@ -210,6 +390,15 @@ struct TomlCamera {
     overlay_font_size: Option<u32>,
     no_overlay: Option<bool>,
     scale: Option<bool>,
+    sub_stream: Option<bool>,
+    sub_width: Option<u32>,
+    sub_height: Option<u32>,
+    sub_fps: Option<u32>,
+    sub_bitrate: Option<u32>,
+    sub_rtsp_path: Option<String>,
+    sub_rtp_port: Option<u16>,
+    sub_codec: Option<String>,
+    sub_preset: Option<String>,
     no_ffmpeg: Option<bool>,
     no_discovery: Option<bool>,
 }
@@ -232,7 +421,7 @@ pub fn load_from_env() -> Result<Startup, String> {
         }
         configs
     } else {
-        vec![cli.into()]
+        vec![Config::try_from(cli)?]
     };
 
     Ok(Startup {
@@ -241,8 +430,23 @@ pub fn load_from_env() -> Result<Startup, String> {
     })
 }
 
-impl From<Cli> for Config {
-    fn from(cli: Cli) -> Self {
+impl TryFrom<Cli> for Config {
+    type Error = String;
+
+    fn try_from(cli: Cli) -> Result<Self, String> {
+        let sub = SubOptions {
+            enabled: cli.sub_stream,
+            width: cli.sub_width,
+            height: cli.sub_height,
+            fps: cli.sub_fps,
+            bitrate: cli.sub_bitrate_kbps,
+            rtsp_path: cli.sub_rtsp_path.clone(),
+            rtp_port: cli.sub_rtp_port,
+            codec: cli.sub_codec.clone(),
+            preset: cli.sub_preset.clone(),
+        }
+        .into_sub_stream()?;
+
         let overlay_text = if cli.no_overlay {
             None
         } else {
@@ -251,7 +455,7 @@ impl From<Cli> for Config {
                 .or_else(|| Some(cli.camera_name.clone()))
         };
 
-        Self {
+        Ok(Self {
             camera_name: cli.camera_name,
             uuid: cli.uuid.unwrap_or_else(util::make_uuid),
             http_addr: cli.http_addr,
@@ -282,9 +486,10 @@ impl From<Cli> for Config {
             },
             overlay_font_size: cli.overlay_font_size,
             scale: cli.scale,
+            sub,
             no_ffmpeg: cli.no_ffmpeg,
             no_discovery: cli.no_discovery,
-        }
+        })
     }
 }
 
@@ -406,6 +611,19 @@ fn camera_from_toml(
             index,
         )?,
         scale: choose_copy(&camera.scale, &defaults.scale, false),
+        sub: SubOptions {
+            enabled: choose_copy(&camera.sub_stream, &defaults.sub_stream, false),
+            width: camera.sub_width.or(defaults.sub_width),
+            height: camera.sub_height.or(defaults.sub_height),
+            fps: camera.sub_fps.or(defaults.sub_fps),
+            bitrate: camera.sub_bitrate.or(defaults.sub_bitrate),
+            rtsp_path: choose_optional_string(&camera.sub_rtsp_path, &defaults.sub_rtsp_path),
+            rtp_port: camera.sub_rtp_port.or(defaults.sub_rtp_port),
+            codec: choose_optional_string(&camera.sub_codec, &defaults.sub_codec),
+            preset: choose_optional_string(&camera.sub_preset, &defaults.sub_preset),
+        }
+        .into_sub_stream()
+        .map_err(|err| format!("camera {}: {err}", index + 1))?,
         no_ffmpeg: choose_copy(&camera.no_ffmpeg, &defaults.no_ffmpeg, false),
         no_discovery: choose_copy(&camera.no_discovery, &defaults.no_discovery, false),
     })
@@ -439,6 +657,7 @@ impl Default for Config {
             overlay_font: default_overlay_font(),
             overlay_font_size: 32,
             scale: false,
+            sub: None,
             no_ffmpeg: false,
             no_discovery: false,
         }
@@ -612,15 +831,113 @@ fn validate_fleet(configs: &[Config]) -> Result<(), String> {
             ));
         }
 
-        if !udp_ports.insert(config.rtp_port) {
-            return Err(format!("duplicate UDP RTP port {}", config.rtp_port));
-        }
+        let mut paths = HashSet::new();
+        for stream in config.streams() {
+            if !paths.insert(stream.rtsp_path.clone()) {
+                return Err(format!(
+                    "camera {}: {} stream reuses RTSP path \"{}\"",
+                    config.camera_name, stream.name, stream.rtsp_path
+                ));
+            }
 
-        let rtcp_port = config.rtp_port + 1;
-        if !udp_ports.insert(rtcp_port) {
-            return Err(format!("duplicate UDP RTCP port {rtcp_port}"));
+            if !udp_ports.insert(stream.rtp_port) {
+                return Err(format!(
+                    "duplicate UDP RTP port {} ({} stream of {})",
+                    stream.rtp_port, stream.name, config.camera_name
+                ));
+            }
+
+            let rtcp_port = stream.rtp_port + 1;
+            if !udp_ports.insert(rtcp_port) {
+                return Err(format!(
+                    "duplicate UDP RTCP port {rtcp_port} ({} stream of {})",
+                    stream.name, config.camera_name
+                ));
+            }
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sub(width: Option<u32>, height: Option<u32>) -> SubStream {
+        SubOptions {
+            enabled: true,
+            width,
+            height,
+            ..SubOptions::default()
+        }
+        .into_sub_stream()
+        .unwrap()
+        .unwrap()
+    }
+
+    #[test]
+    fn sub_defaults_to_240_lines_with_main_aspect() {
+        assert_eq!(sub_dimensions(&sub(None, None), 1920, 1080), (426, 240));
+        assert_eq!(sub_dimensions(&sub(None, None), 1280, 720), (426, 240));
+        assert_eq!(sub_dimensions(&sub(None, None), 640, 480), (320, 240));
+    }
+
+    #[test]
+    fn sub_derives_missing_side_and_keeps_dimensions_even() {
+        assert_eq!(
+            sub_dimensions(&sub(Some(640), None), 1920, 1080),
+            (640, 360)
+        );
+        assert_eq!(
+            sub_dimensions(&sub(None, Some(360)), 1920, 1080),
+            (640, 360)
+        );
+        assert_eq!(
+            sub_dimensions(&sub(Some(641), Some(361)), 1920, 1080),
+            (640, 360)
+        );
+    }
+
+    #[test]
+    fn streams_lists_main_then_sub_with_defaults() {
+        let config = Config {
+            sub: Some(sub(None, None)),
+            ..Config::default()
+        };
+        let streams = config.streams();
+        assert_eq!(streams.len(), 2);
+        assert_eq!(streams[0].rtsp_path, "live");
+        assert_eq!(streams[1].rtsp_path, "live_sub");
+        assert_eq!(streams[1].rtp_port, 6004);
+        assert_eq!(streams[1].fps, config.fps);
+        assert_eq!(streams[1].bitrate_kbps, 512);
+        assert_eq!(streams[1].codec, "libx264");
+    }
+
+    #[test]
+    fn sub_options_without_enable_are_rejected() {
+        let options = SubOptions {
+            width: Some(320),
+            ..SubOptions::default()
+        };
+        assert!(options.into_sub_stream().is_err());
+    }
+
+    #[test]
+    fn fleet_rejects_colliding_sub_ports_and_paths() {
+        let mut a = Config::default();
+        a.uuid = "a".to_string();
+        a.sub = Some(sub(None, None));
+        let mut b = Config::default();
+        b.uuid = "b".to_string();
+        b.http_addr = "0.0.0.0:8001".parse().unwrap();
+        b.rtsp_port = 8555;
+        b.rtp_port = 6004; // collides with a's sub stream
+        assert!(validate_fleet(&[a.clone(), b]).is_err());
+
+        let mut same_path = a;
+        same_path.sub.as_mut().unwrap().rtsp_path = "live".to_string();
+        assert!(validate_fleet(&[same_path]).is_err());
+    }
 }

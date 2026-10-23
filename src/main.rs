@@ -98,28 +98,30 @@ fn main() -> process::ExitCode {
         println!("uuid: {}", config.uuid);
         println!("device service: {}", onvif::device_xaddr(config));
         println!("media service: {}", onvif::media_xaddr(config));
-        println!("rtsp stream: {}", onvif::rtsp_uri(config));
+        for stream in config.streams() {
+            println!(
+                "rtsp {} stream: {}  ({}x{} @ {}fps, {}k {})",
+                stream.name,
+                onvif::rtsp_uri(config, &stream),
+                stream.width,
+                stream.height,
+                stream.fps,
+                stream.bitrate_kbps,
+                stream.codec
+            );
+        }
         match &config.media_input {
             config::MediaInput::File(path) => println!(
-                "video: {}x{} @ {}fps  file: {}{}",
-                config.width,
-                config.height,
-                config.fps,
+                "source: file {}{}",
                 path.display(),
                 if config.scale { "  (scaled)" } else { "" }
             ),
-            config::MediaInput::TestPattern => println!(
-                "video: {}x{} @ {}fps  test pattern",
-                config.width, config.height, config.fps
-            ),
+            config::MediaInput::TestPattern => println!("source: test pattern"),
         }
 
         match rtsp::spawn(config.clone()) {
             Ok(server) => {
-                println!(
-                    "rtsp: listening on rtsp://0.0.0.0:{}/{}",
-                    config.rtsp_port, config.rtsp_path
-                );
+                println!("rtsp: listening on rtsp://0.0.0.0:{}", config.rtsp_port);
                 rtsp_servers.push(server);
             }
             Err(err) => {

@@ -121,16 +121,24 @@ fn read_request(stream: &TcpStream) -> io::Result<Request> {
 
 fn soap_response_for(body: &str, config: &Config) -> Vec<u8> {
     let operation = onvif::detect_operation(body);
-    let xml = onvif::soap_response(operation.as_deref(), config);
+    let xml = onvif::soap_response(operation.as_deref(), config, body);
     binary_response(200, "application/soap+xml; charset=utf-8", xml.as_bytes())
 }
 
 fn landing_text(config: &Config) -> String {
     format!(
-        "fake-onvif-cam\n\nDevice service: {}\nMedia service: {}\nRTSP stream: {}\nSnapshot: {}\n",
+        "fake-onvif-cam\n\nDevice service: {}\nMedia service: {}\n{}Snapshot: {}\n",
         onvif::device_xaddr(config),
         onvif::media_xaddr(config),
-        onvif::rtsp_uri(config),
+        config
+            .streams()
+            .iter()
+            .map(|stream| format!(
+                "RTSP {} stream: {}\n",
+                stream.name,
+                onvif::rtsp_uri(config, stream)
+            ))
+            .collect::<String>(),
         onvif::snapshot_uri(config)
     )
 }

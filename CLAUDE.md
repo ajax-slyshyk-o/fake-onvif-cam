@@ -29,7 +29,7 @@ cargo test
 cargo clippy
 ```
 
-There is only a small unit-test suite (`export.rs`, `util.rs`).
+There is only a small unit-test suite (`config.rs`, `onvif.rs`, `rtsp.rs`, `ffmpeg.rs`, `export.rs`, `util.rs`).
 
 ## Architecture
 
@@ -45,16 +45,18 @@ main thread
     ├── HTTP thread     — ONVIF SOAP on TCP (default :8000)
     ├── RTSP accept     — clients connect on TCP (default :8554)
     │   └── per client thread
-    ├── RTP relay       — receives UDP from ffmpeg (:5004), broadcasts to RTSP clients
-    ├── RTCP relay      — same for RTCP (:5005)
-    └── ffmpeg process  — encodes video → RTP, supervised with auto-restart
+    ├── RTP relay       — per stream; receives UDP from ffmpeg (:5004), broadcasts to RTSP clients
+    ├── RTCP relay      — per stream; same for RTCP (:5005)
+    └── ffmpeg process  — one per camera; encodes main (+ optional sub) → RTP, supervised with auto-restart
 ```
+
+With `sub_stream = true` a camera has two streams (`Config::streams()`: main first, then sub). Each stream has its own RTSP path, RTP/RTCP port pair, relay threads and client list; the RTSP accept loop routes DESCRIBE/SETUP by URL path, and `onvif.rs` emits one profile per stream (`profile_1`, `profile_2`).
 
 **Module responsibilities:**
 
 | File | Responsibility |
 |------|----------------|
-| `config.rs` | CLI (`clap`) + TOML parsing, fleet validation, host auto-detection |
+| `config.rs` | CLI (`clap`) + TOML parsing, `Config::streams()` (main/sub resolution), fleet validation, host auto-detection |
 | `discovery.rs` | WS-Discovery: parse UDP Probe, reply with ProbeMatch SOAP |
 | `onvif.rs` | All ONVIF SOAP XML generation (17+ operations for Device + Media services) |
 | `http.rs` | Minimal HTTP server: routes `/`, `/snapshot.jpg`, `/onvif/device_service`, `/onvif/media_service` |
@@ -88,6 +90,7 @@ uuid = "00000000-0000-4550-98a8-98a80cab1b88"  # stable UUID for NVR persistence
 http = "0.0.0.0:8000"
 rtsp_port = 8554
 rtp_port = 5004   # RTCP uses rtp_port+1 automatically
+sub_stream = true # optional 2nd stream: /live_sub, 240p, 512k, RTP port rtp_port+1000 (see README)
 
 [[cameras]]
 name = "Fake Camera 02"

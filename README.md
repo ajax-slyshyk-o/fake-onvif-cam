@@ -65,6 +65,27 @@ When `--scale` is not set, `width`/`height`/`fps` are only used for the generate
 
 `--scale` works in both directions: use it to upscale a Full HD file to 4K as well as to downscale a large file. The scale filter does not preserve the aspect ratio, so keep the target in the same ratio as the source. Upscaling adds no detail, and the output bitrate is not changed by `--scale` (see below).
 
+## Sub stream
+
+Real cameras publish a high-resolution main stream and a low-resolution sub stream, and NVRs use the sub stream for live grids. Add `--sub-stream` (or `sub_stream = true` in TOML) to publish both:
+
+```powershell
+cargo run -- --advertise-host 192.168.1.50 --width 1920 --height 1080 --sub-stream
+```
+
+The camera then advertises two ONVIF profiles (`profile_1` main, `profile_2` sub) and serves two RTSP paths on the same RTSP port (`/live` and `/live_sub`). `GetStreamUri`, `GetProfile` and `GetVideoEncoderConfigurationOptions` follow the `ProfileToken` of the request. A single ffmpeg process decodes the source once and encodes both streams; an unknown RTSP path returns 404 when a sub stream is enabled.
+
+| CLI | TOML | Default |
+|---|---|---|
+| `--sub-width`, `--sub-height` | `sub_width`, `sub_height` | 240 lines high, main aspect ratio (a missing side keeps the main aspect ratio) |
+| `--sub-fps` | `sub_fps` | main fps |
+| `--sub-bitrate` | `sub_bitrate` | `512` kbit/s |
+| `--sub-rtsp-path` | `sub_rtsp_path` | `live_sub` |
+| `--sub-rtp-port` | `sub_rtp_port` | `rtp_port + 1000` (RTCP is the next port) |
+| `--sub-codec`, `--sub-preset` | `sub_codec`, `sub_preset` | `libx264`, codec default |
+
+The sub stream uses software `libx264` by default even when the main stream uses a hardware encoder, so a camera does not take a second NVENC session (consumer GPUs limit concurrent sessions). `sub_*` options without `sub_stream = true` are rejected. Sub-stream UDP ports take part in the fleet port-collision check.
+
 ## Bitrate, codec and preset
 
 The encoder settings are independent of `--scale`:
@@ -167,6 +188,7 @@ Ready-made examples in the repository:
 --bitrate <kbit/s>        Target video bitrate. Default: 2500
 --codec <encoder>         ffmpeg H.264 encoder: libx264, h264_nvenc, h264_qsv, h264_amf, ... Default: libx264
 --preset <name>           Encoder preset. Default depends on the codec (libx264: veryfast, h264_nvenc: p2).
+--sub-stream              Also publish a low-resolution sub stream (see Sub stream).
 --overlay-text <text>     Text burned into the video. Default: camera name.
 --overlay-font <path>     Font file used for the overlay. Default: a platform system font.
 --overlay-font-size <px>  Overlay font size. Default: 32

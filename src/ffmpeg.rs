@@ -1,4 +1,4 @@
-use crate::config::{Config, MediaInput};
+use crate::config::{Config, MediaInput, Stream};
 use std::io;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -28,10 +28,7 @@ pub fn probe_file(ffmpeg_path: &Path, file: &Path) -> Result<(u32, u32, u32), St
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "ffprobe exited with {}: {stderr}",
-            output.status
-        ));
+        return Err(format!("ffprobe exited with {}: {stderr}", output.status));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -50,7 +47,9 @@ pub fn probe_file(ffmpeg_path: &Path, file: &Path) -> Result<(u32, u32, u32), St
     let fps = parse_fps_rational(parts[2])?;
 
     if width == 0 || height == 0 {
-        return Err(format!("ffprobe returned zero dimensions: {width}x{height}"));
+        return Err(format!(
+            "ffprobe returned zero dimensions: {width}x{height}"
+        ));
     }
 
     Ok((width, height, fps))
@@ -79,10 +78,7 @@ fn parse_fps_rational(s: &str) -> Result<u32, String> {
             .map_err(|_| format!("bad fps denominator: {d}"))?;
         (num, den)
     } else {
-        (
-            s.parse::<u64>().map_err(|_| format!("bad fps: {s}"))?,
-            1,
-        )
+        (s.parse::<u64>().map_err(|_| format!("bad fps: {s}"))?, 1)
     };
 
     if den == 0 {
@@ -126,11 +122,14 @@ pub fn start(config: &Config) -> io::Result<Option<FfmpegGuard>> {
         )));
     }
 
-    println!(
-        "ffmpeg: sending RTP to 127.0.0.1:{} and RTCP to 127.0.0.1:{}",
-        config.rtp_port,
-        config.rtp_port + 1
-    );
+    for stream in config.streams() {
+        println!(
+            "ffmpeg: {} stream RTP to 127.0.0.1:{} and RTCP to 127.0.0.1:{}",
+            stream.name,
+            stream.rtp_port,
+            stream.rtp_port + 1
+        );
+    }
 
     let stop = Arc::new(AtomicBool::new(false));
     let worker_stop = stop.clone();
@@ -180,11 +179,6 @@ fn supervise(config: Config, mut child: Child, stop: Arc<AtomicBool>) {
 }
 
 fn spawn_child(config: &Config) -> io::Result<Child> {
-    let rtp_url = format!(
-        "rtp://127.0.0.1:{}?rtcpport={}&pkt_size=1200",
-        config.rtp_port,
-        config.rtp_port + 1
-    );
     let mut command = Command::new(&config.ffmpeg_path);
     command
         .arg("-hide_banner")
@@ -230,15 +224,61 @@ fn spawn_child(config: &Config) -> io::Result<Child> {
         ));
     }
 
-    if !vfilters.is_empty() {
-        command.arg("-vf").arg(vfilters.join(","));
+    // One process and one decode for all streams: the (overlaid) video is split and the
+    // sub stream is scaled down from the copy.
+    let streams = config.streams();
+    match streams.as_slice() {
+        [main] => {
+            if !vfilters.is_empty() {
+                command.arg("-vf").arg(vfilters.join(","));
+            }
+            add_output(&mut command, main, 1);
+        }
+        [main, sub] => {
+            command
+                .arg("-filter_complex")
+                .arg(split_filter_graph(&vfilters, sub));
+            command.arg("-map").arg("[main]");
+            add_output(&mut command, main, 1);
+            command.arg("-map").arg("[sub]");
+            add_output(&mut command, sub, 2);
+        }
+        _ => return Err(io::Error::other("unsupported number of streams")),
     }
 
-    let keyframe_interval = config.fps.to_string();
-    let bitrate = format!("{}k", config.bitrate_kbps);
-    let bufsize = format!("{}k", config.bitrate_kbps.saturating_mul(2));
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+
+    command.spawn()
+}
+
+fn split_filter_graph(vfilters: &[String], sub: &Stream) -> String {
+    let prefix = if vfilters.is_empty() {
+        String::new()
+    } else {
+        format!("{},", vfilters.join(","))
+    };
+
+    format!(
+        "[0:v]{prefix}split=2[main][subraw];[subraw]scale={}:{},fps={}[sub]",
+        sub.width, sub.height, sub.fps
+    )
+}
+
+/// Output options for one stream: encoder, rate control and the RTP destination.
+fn add_output(command: &mut Command, stream: &Stream, ssrc: u32) {
+    let rtp_url = format!(
+        "rtp://127.0.0.1:{}?rtcpport={}&pkt_size=1200",
+        stream.rtp_port,
+        stream.rtp_port + 1
+    );
+    let bitrate = format!("{}k", stream.bitrate_kbps);
+    let bufsize = format!("{}k", stream.bitrate_kbps.saturating_mul(2));
+
     command.arg("-an");
-    add_encoder_args(&mut command, config);
+    add_encoder_args(command, &stream.codec, stream.preset.as_deref());
     command
         .arg("-bf")
         .arg("0")
@@ -249,27 +289,19 @@ fn spawn_child(config: &Config) -> io::Result<Child> {
         .arg("-bufsize")
         .arg(&bufsize)
         .arg("-g")
-        .arg(keyframe_interval)
+        .arg(stream.fps.to_string())
         .arg("-f")
         .arg("rtp")
         .arg("-payload_type")
         .arg("96")
         .arg("-ssrc")
-        .arg("1")
-        .arg(rtp_url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
-
-    command.spawn()
+        .arg(ssrc.to_string())
+        .arg(rtp_url);
 }
 
 /// Encoder-specific arguments. The RTSP SDP carries no sprop-parameter-sets, so every
 /// encoder must repeat SPS/PPS in-band on keyframes.
-fn add_encoder_args(command: &mut Command, config: &Config) {
-    let codec = config.codec.as_str();
-    let preset = config.preset.as_deref();
-
+fn add_encoder_args(command: &mut Command, codec: &str, preset: Option<&str>) {
     command.arg("-c:v").arg(codec);
 
     match codec {
@@ -370,4 +402,44 @@ fn escape_drawtext_value(text: &str) -> String {
     }
 
     escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sub_stream() -> Stream {
+        Stream {
+            name: "sub",
+            rtsp_path: "live_sub".to_string(),
+            width: 426,
+            height: 240,
+            fps: 24,
+            bitrate_kbps: 512,
+            rtp_port: 6004,
+            codec: "libx264".to_string(),
+            preset: None,
+        }
+    }
+
+    #[test]
+    fn filter_graph_splits_after_overlay() {
+        let graph = split_filter_graph(
+            &["scale=1280:720".to_string(), "drawtext=x".to_string()],
+            &sub_stream(),
+        );
+        assert_eq!(
+            graph,
+            "[0:v]scale=1280:720,drawtext=x,split=2[main][subraw];[subraw]scale=426:240,fps=24[sub]"
+        );
+    }
+
+    #[test]
+    fn filter_graph_without_prefix_filters() {
+        let graph = split_filter_graph(&[], &sub_stream());
+        assert_eq!(
+            graph,
+            "[0:v]split=2[main][subraw];[subraw]scale=426:240,fps=24[sub]"
+        );
+    }
 }

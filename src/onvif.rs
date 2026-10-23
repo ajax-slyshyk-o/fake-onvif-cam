@@ -1,10 +1,42 @@
-use crate::config::Config;
+use crate::config::{Config, Stream};
 use crate::util;
 
-const PROFILE_TOKEN: &str = "profile_1";
 const VIDEO_SOURCE_TOKEN: &str = "video_source_1";
 const VIDEO_SOURCE_CONFIG_TOKEN: &str = "video_source_config_1";
-const VIDEO_ENCODER_CONFIG_TOKEN: &str = "video_encoder_config_1";
+
+fn profile_token(index: usize) -> String {
+    format!("profile_{}", index + 1)
+}
+
+fn video_encoder_config_token(index: usize) -> String {
+    format!("video_encoder_config_{}", index + 1)
+}
+
+/// Text of the first `<...:name>value</...>` element in a SOAP request.
+fn request_value<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
+    let marker = format!("{name}>");
+    let start = xml.find(&marker)? + marker.len();
+    let value = &xml[start..xml[start..].find('<').map_or(xml.len(), |end| start + end)];
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
+}
+
+/// Resolves the stream a request refers to: by `ProfileToken`, else by encoder
+/// `ConfigurationToken`. Without a token the main stream is used.
+fn requested_stream(config: &Config, request: &str) -> Result<(usize, Stream), String> {
+    let streams = config.streams();
+    let found = if let Some(token) = request_value(request, "ProfileToken") {
+        (0..streams.len()).find(|index| profile_token(*index) == token)
+    } else if let Some(token) = request_value(request, "ConfigurationToken") {
+        (0..streams.len()).find(|index| video_encoder_config_token(*index) == token)
+    } else {
+        Some(0)
+    };
+
+    found
+        .map(|index| (index, streams[index].clone()))
+        .ok_or_else(|| "No such profile or configuration token".to_string())
+}
 
 pub fn device_xaddr(config: &Config) -> String {
     format!(
@@ -30,10 +62,10 @@ pub fn snapshot_uri(config: &Config) -> String {
     )
 }
 
-pub fn rtsp_uri(config: &Config) -> String {
+pub fn rtsp_uri(config: &Config, stream: &Stream) -> String {
     format!(
         "rtsp://{}:{}/{}",
-        config.advertise_host, config.rtsp_port, config.rtsp_path
+        config.advertise_host, config.rtsp_port, stream.rtsp_path
     )
 }
 
@@ -103,7 +135,7 @@ pub fn discovery_probe_match(config: &Config, relates_to: &str) -> String {
     )
 }
 
-pub fn soap_response(operation: Option<&str>, config: &Config) -> String {
+pub fn soap_response(operation: Option<&str>, config: &Config, request: &str) -> String {
     let body = match operation {
         Some("GetCapabilities") => get_capabilities(config),
         Some("GetDeviceInformation") => get_device_information(config),
@@ -113,15 +145,19 @@ pub fn soap_response(operation: Option<&str>, config: &Config) -> String {
         Some("GetHostname") => get_hostname(config),
         Some("GetNetworkInterfaces") => get_network_interfaces(config),
         Some("GetProfiles") => get_profiles(config),
-        Some("GetProfile") => get_profile(config),
-        Some("GetStreamUri") => get_stream_uri(config),
+        Some("GetProfile") => requested_stream(config, request)
+            .map(|(index, stream)| get_profile(config, index, &stream))
+            .unwrap_or_else(|reason| soap_fault(&reason)),
+        Some("GetStreamUri") => requested_stream(config, request)
+            .map(|(_, stream)| get_stream_uri(config, &stream))
+            .unwrap_or_else(|reason| soap_fault(&reason)),
         Some("GetSnapshotUri") => get_snapshot_uri(config),
         Some("GetVideoSources") => get_video_sources(config),
         Some("GetVideoSourceConfigurations") => get_video_source_configurations(config),
         Some("GetVideoEncoderConfigurations") => get_video_encoder_configurations(config),
-        Some("GetVideoEncoderConfigurationOptions") => {
-            get_video_encoder_configuration_options(config)
-        }
+        Some("GetVideoEncoderConfigurationOptions") => requested_stream(config, request)
+            .map(|(_, stream)| get_video_encoder_configuration_options(&stream))
+            .unwrap_or_else(|reason| soap_fault(&reason)),
         Some("GetServiceCapabilities") => get_service_capabilities(),
         Some("SetSynchronizationPoint") => "<trt:SetSynchronizationPointResponse/>".to_string(),
         Some(other) => soap_fault(&format!("Unsupported ONVIF operation: {other}")),
@@ -306,39 +342,52 @@ fn get_network_interfaces(config: &Config) -> String {
 }
 
 fn get_profiles(config: &Config) -> String {
+    let profiles: Vec<String> = config
+        .streams()
+        .iter()
+        .enumerate()
+        .map(|(index, stream)| profile_xml(config, index, stream))
+        .collect();
+
     format!(
         r#"<trt:GetProfilesResponse>
   {}
 </trt:GetProfilesResponse>"#,
-        profile_xml(config)
+        profiles.join("\n  ")
     )
 }
 
-fn get_profile(config: &Config) -> String {
+fn get_profile(config: &Config, index: usize, stream: &Stream) -> String {
     format!(
         r#"<trt:GetProfileResponse>
   {}
 </trt:GetProfileResponse>"#,
-        profile_xml(config)
+        profile_xml(config, index, stream)
     )
 }
 
-fn profile_xml(config: &Config) -> String {
-    let camera_name = util::xml_escape(&config.camera_name);
+fn profile_xml(config: &Config, index: usize, stream: &Stream) -> String {
+    let name = if index == 0 {
+        config.camera_name.clone()
+    } else {
+        format!("{} {}", config.camera_name, stream.name)
+    };
+    let name = util::xml_escape(&name);
+    let token = profile_token(index);
 
     format!(
-        r#"<trt:Profiles token="{PROFILE_TOKEN}" fixed="true">
-    <tt:Name>{camera_name}</tt:Name>
+        r#"<trt:Profiles token="{token}" fixed="true">
+    <tt:Name>{name}</tt:Name>
     {}
     {}
   </trt:Profiles>"#,
         video_source_configuration_xml(config),
-        video_encoder_configuration_xml(config)
+        video_encoder_configuration_xml(index, stream)
     )
 }
 
-fn get_stream_uri(config: &Config) -> String {
-    let uri = util::xml_escape(&rtsp_uri(config));
+fn get_stream_uri(config: &Config, stream: &Stream) -> String {
+    let uri = util::xml_escape(&rtsp_uri(config, stream));
 
     format!(
         r#"<trt:GetStreamUriResponse>
@@ -395,29 +444,43 @@ fn video_source_configuration_xml(config: &Config) -> String {
     format!(
         r#"<tt:VideoSourceConfiguration token="{VIDEO_SOURCE_CONFIG_TOKEN}">
       <tt:Name>VideoSourceConfig</tt:Name>
-      <tt:UseCount>1</tt:UseCount>
+      <tt:UseCount>{}</tt:UseCount>
       <tt:SourceToken>{VIDEO_SOURCE_TOKEN}</tt:SourceToken>
       <tt:Bounds x="0" y="0" width="{}" height="{}"/>
     </tt:VideoSourceConfiguration>"#,
-        config.width, config.height
+        config.streams().len(),
+        config.width,
+        config.height
     )
 }
 
 fn get_video_encoder_configurations(config: &Config) -> String {
+    let configurations: Vec<String> = config
+        .streams()
+        .iter()
+        .enumerate()
+        .map(|(index, stream)| video_encoder_configuration_xml(index, stream))
+        .collect();
+
     format!(
         r#"<trt:GetVideoEncoderConfigurationsResponse>
   {}
 </trt:GetVideoEncoderConfigurationsResponse>"#,
-        video_encoder_configuration_xml(config)
+        configurations.join("\n  ")
     )
 }
 
-fn video_encoder_configuration_xml(config: &Config) -> String {
-    let bitrate = bitrate_limit(config);
+fn video_encoder_configuration_xml(index: usize, stream: &Stream) -> String {
+    let token = video_encoder_config_token(index);
+    let name = if index == 0 {
+        "H264Encoder"
+    } else {
+        "H264EncoderSub"
+    };
 
     format!(
-        r#"<tt:VideoEncoderConfiguration token="{VIDEO_ENCODER_CONFIG_TOKEN}">
-      <tt:Name>H264Encoder</tt:Name>
+        r#"<tt:VideoEncoderConfiguration token="{token}">
+      <tt:Name>{name}</tt:Name>
       <tt:UseCount>1</tt:UseCount>
       <tt:Encoding>H264</tt:Encoding>
       <tt:Resolution>
@@ -428,7 +491,7 @@ fn video_encoder_configuration_xml(config: &Config) -> String {
       <tt:RateControl>
         <tt:FrameRateLimit>{}</tt:FrameRateLimit>
         <tt:EncodingInterval>1</tt:EncodingInterval>
-        <tt:BitrateLimit>{bitrate}</tt:BitrateLimit>
+        <tt:BitrateLimit>{}</tt:BitrateLimit>
       </tt:RateControl>
       <tt:H264>
         <tt:GovLength>{}</tt:GovLength>
@@ -445,14 +508,15 @@ fn video_encoder_configuration_xml(config: &Config) -> String {
       </tt:Multicast>
       <tt:SessionTimeout>PT60S</tt:SessionTimeout>
     </tt:VideoEncoderConfiguration>"#,
-        config.width,
-        config.height,
-        config.fps,
-        config.fps * 2
+        stream.width,
+        stream.height,
+        stream.fps,
+        bitrate_limit(stream),
+        stream.fps * 2
     )
 }
 
-fn get_video_encoder_configuration_options(config: &Config) -> String {
+fn get_video_encoder_configuration_options(stream: &Stream) -> String {
     format!(
         r#"<trt:GetVideoEncoderConfigurationOptionsResponse>
   <trt:Options>
@@ -481,11 +545,11 @@ fn get_video_encoder_configuration_options(config: &Config) -> String {
     </tt:H264>
   </trt:Options>
 </trt:GetVideoEncoderConfigurationOptionsResponse>"#,
-        config.width,
-        config.height,
-        config.fps,
-        config.fps * 4,
-        config.fps
+        stream.width,
+        stream.height,
+        stream.fps,
+        stream.fps * 4,
+        stream.fps
     )
 }
 
@@ -507,9 +571,88 @@ fn soap_fault(reason: &str) -> String {
     )
 }
 
-fn bitrate_limit(config: &Config) -> u32 {
-    let pixels = config.width.saturating_mul(config.height);
+fn bitrate_limit(stream: &Stream) -> u32 {
+    let pixels = stream.width.saturating_mul(stream.height);
     let bits_per_frame = pixels.saturating_mul(2);
-    let bits_per_second = bits_per_frame.saturating_mul(config.fps);
+    let bits_per_second = bits_per_frame.saturating_mul(stream.fps);
     (bits_per_second / 1_000).max(512)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SubStream;
+
+    fn two_stream_config() -> Config {
+        Config {
+            width: 1920,
+            height: 1080,
+            sub: Some(SubStream {
+                width: None,
+                height: None,
+                fps: None,
+                bitrate_kbps: 512,
+                rtsp_path: "live_sub".to_string(),
+                rtp_port: None,
+                codec: "libx264".to_string(),
+                preset: None,
+            }),
+            ..Config::default()
+        }
+    }
+
+    fn request(op: &str, token: &str) -> String {
+        format!("<trt:{op}><trt:ProfileToken>{token}</trt:ProfileToken></trt:{op}>")
+    }
+
+    #[test]
+    fn profiles_list_both_streams() {
+        let xml = get_profiles(&two_stream_config());
+        assert!(xml.contains(r#"token="profile_1""#));
+        assert!(xml.contains(r#"token="profile_2""#));
+        assert!(xml.contains("<tt:Width>1920</tt:Width>"));
+        assert!(xml.contains("<tt:Width>426</tt:Width>"));
+    }
+
+    #[test]
+    fn stream_uri_follows_profile_token() {
+        let config = two_stream_config();
+        let main = soap_response(
+            Some("GetStreamUri"),
+            &config,
+            &request("GetStreamUri", "profile_1"),
+        );
+        let sub = soap_response(
+            Some("GetStreamUri"),
+            &config,
+            &request("GetStreamUri", "profile_2"),
+        );
+        assert!(main.contains("/live</tt:Uri>"));
+        assert!(sub.contains("/live_sub</tt:Uri>"));
+    }
+
+    #[test]
+    fn unknown_profile_token_is_a_fault() {
+        let config = two_stream_config();
+        let xml = soap_response(
+            Some("GetStreamUri"),
+            &config,
+            &request("GetStreamUri", "nope"),
+        );
+        assert!(xml.contains("<s:Fault>"));
+    }
+
+    #[test]
+    fn missing_token_defaults_to_main_stream() {
+        let config = two_stream_config();
+        let xml = soap_response(Some("GetStreamUri"), &config, "<trt:GetStreamUri/>");
+        assert!(xml.contains("/live</tt:Uri>"));
+    }
+
+    #[test]
+    fn single_stream_camera_has_one_profile() {
+        let xml = get_profiles(&Config::default());
+        assert!(xml.contains(r#"token="profile_1""#));
+        assert!(!xml.contains("profile_2"));
+    }
 }

@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, Stream};
 use crate::onvif;
 use crate::util;
 use std::collections::HashMap;
@@ -56,8 +56,18 @@ struct TcpPacket {
     data: Vec<u8>,
 }
 
+/// Per-stream relay state: the stream description, its RTP/RTCP ingest sockets (fed by
+/// ffmpeg) and the RTSP clients currently subscribed to it.
+struct StreamRelay {
+    stream: Stream,
+    clients: Clients,
+    rtp_socket: Arc<UdpSocket>,
+    rtcp_socket: Arc<UdpSocket>,
+}
+
 struct RtspRequest {
     method: String,
+    uri: String,
     headers: HashMap<String, String>,
 }
 
@@ -78,31 +88,45 @@ pub fn spawn(config: Arc<Config>) -> io::Result<RtspServerGuard> {
     let listener = TcpListener::bind(("0.0.0.0", config.rtsp_port))?;
     listener.set_nonblocking(true)?;
 
-    let rtp_socket = Arc::new(UdpSocket::bind(("127.0.0.1", config.rtp_port))?);
-    let rtcp_socket = Arc::new(UdpSocket::bind(("127.0.0.1", config.rtp_port + 1))?);
-    rtp_socket.set_read_timeout(Some(Duration::from_millis(500)))?;
-    rtcp_socket.set_read_timeout(Some(Duration::from_millis(500)))?;
-
-    let clients = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
-    let workers = vec![
-        spawn_accept_loop(
-            listener,
-            config.clone(),
-            clients.clone(),
-            rtp_socket.clone(),
-            rtcp_socket.clone(),
-            stop.clone(),
-        )?,
-        spawn_relay_loop(
-            "rtp-relay",
+    let mut relays = Vec::new();
+    let mut workers = Vec::new();
+
+    for stream in config.streams() {
+        let rtp_socket = Arc::new(UdpSocket::bind(("127.0.0.1", stream.rtp_port))?);
+        let rtcp_socket = Arc::new(UdpSocket::bind(("127.0.0.1", stream.rtp_port + 1))?);
+        rtp_socket.set_read_timeout(Some(Duration::from_millis(500)))?;
+        rtcp_socket.set_read_timeout(Some(Duration::from_millis(500)))?;
+
+        let clients: Clients = Arc::new(Mutex::new(Vec::new()));
+        workers.push(spawn_relay_loop(
+            &format!("rtp-relay-{}", stream.name),
             rtp_socket.clone(),
             clients.clone(),
             stop.clone(),
             false,
-        )?,
-        spawn_relay_loop("rtcp-relay", rtcp_socket, clients, stop.clone(), true)?,
-    ];
+        )?);
+        workers.push(spawn_relay_loop(
+            &format!("rtcp-relay-{}", stream.name),
+            rtcp_socket.clone(),
+            clients.clone(),
+            stop.clone(),
+            true,
+        )?);
+        relays.push(Arc::new(StreamRelay {
+            stream,
+            clients,
+            rtp_socket,
+            rtcp_socket,
+        }));
+    }
+
+    workers.push(spawn_accept_loop(
+        listener,
+        config,
+        Arc::new(relays),
+        stop.clone(),
+    )?);
 
     Ok(RtspServerGuard { stop, workers })
 }
@@ -110,9 +134,7 @@ pub fn spawn(config: Arc<Config>) -> io::Result<RtspServerGuard> {
 fn spawn_accept_loop(
     listener: TcpListener,
     config: Arc<Config>,
-    clients: Clients,
-    rtp_socket: Arc<UdpSocket>,
-    rtcp_socket: Arc<UdpSocket>,
+    relays: Arc<Vec<Arc<StreamRelay>>>,
     stop: Arc<AtomicBool>,
 ) -> io::Result<JoinHandle<()>> {
     thread::Builder::new()
@@ -122,21 +144,12 @@ fn spawn_accept_loop(
                 match listener.accept() {
                     Ok((stream, peer)) => {
                         let config = config.clone();
-                        let clients = clients.clone();
-                        let rtp_socket = rtp_socket.clone();
-                        let rtcp_socket = rtcp_socket.clone();
+                        let relays = relays.clone();
 
                         let _ = thread::Builder::new()
                             .name("rtsp-client".to_string())
                             .spawn(move || {
-                                if let Err(err) = handle_client(
-                                    stream,
-                                    peer,
-                                    config,
-                                    clients,
-                                    rtp_socket,
-                                    rtcp_socket,
-                                ) {
+                                if let Err(err) = handle_client(stream, peer, config, relays) {
                                     eprintln!("rtsp client {peer} failed: {err}");
                                 }
                             });
@@ -249,9 +262,7 @@ fn handle_client(
     stream: TcpStream,
     peer: SocketAddr,
     config: Arc<Config>,
-    clients: Clients,
-    rtp_socket: Arc<UdpSocket>,
-    rtcp_socket: Arc<UdpSocket>,
+    relays: Arc<Vec<Arc<StreamRelay>>>,
 ) -> io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(90)))?;
@@ -263,6 +274,8 @@ fn handle_client(
     let session = util::make_uuid();
     let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
     let playing = Arc::new(AtomicBool::new(false));
+    // Stream this connection is subscribed to (index into `relays`), set by SETUP.
+    let mut subscribed: Option<usize> = None;
 
     while let Some(request) = read_request(&mut reader)? {
         let cseq = request.cseq();
@@ -280,35 +293,52 @@ fn handle_client(
                 &[],
             )?,
             "DESCRIBE" => {
-                let body = sdp(&config);
+                let Some(index) = find_stream(&relays, &request.uri) else {
+                    write_response(&writer, 404, "Not Found", &cseq, &[], &[])?;
+                    continue;
+                };
+                let stream = &relays[index].stream;
+                let body = sdp(&config, stream);
                 write_response(
                     &writer,
                     200,
                     "OK",
                     &cseq,
                     &[
-                        ("Content-Base", format!("{}/", onvif::rtsp_uri(&config))),
+                        (
+                            "Content-Base",
+                            format!("{}/", onvif::rtsp_uri(&config, stream)),
+                        ),
                         ("Content-Type", "application/sdp".to_string()),
                     ],
                     body.as_bytes(),
                 )?;
             }
             "SETUP" => {
+                let Some(index) = find_stream(&relays, &request.uri) else {
+                    write_response(&writer, 404, "Not Found", &cseq, &[], &[])?;
+                    continue;
+                };
+                let relay = &relays[index];
                 let transport = request.header("Transport").unwrap_or("");
                 let Some((sink, response_transport)) = setup_transport(
                     transport,
                     peer,
                     writer.clone(),
-                    rtp_socket.clone(),
-                    rtcp_socket.clone(),
-                    &config,
+                    relay.rtp_socket.clone(),
+                    relay.rtcp_socket.clone(),
+                    &relay.stream,
                 ) else {
                     write_response(&writer, 461, "Unsupported Transport", &cseq, &[], &[])?;
                     continue;
                 };
 
+                if let Some(previous) = subscribed.filter(|previous| *previous != index) {
+                    remove_clients(&relays[previous].clients, &[client_id]);
+                }
+                subscribed = Some(index);
                 replace_client(
-                    &clients,
+                    &relay.clients,
                     Client {
                         id: client_id,
                         playing: playing.clone(),
@@ -329,6 +359,7 @@ fn handle_client(
             }
             "PLAY" => {
                 playing.store(true, Ordering::Relaxed);
+                let stream = &relays[subscribed.unwrap_or(0)].stream;
                 write_response(
                     &writer,
                     200,
@@ -338,7 +369,10 @@ fn handle_client(
                         ("Session", session.clone()),
                         (
                             "RTP-Info",
-                            format!("url={}/trackID=0;seq=0;rtptime=0", onvif::rtsp_uri(&config)),
+                            format!(
+                                "url={}/trackID=0;seq=0;rtptime=0",
+                                onvif::rtsp_uri(&config, stream)
+                            ),
                         ),
                     ],
                     &[],
@@ -379,8 +413,31 @@ fn handle_client(
         }
     }
 
-    remove_clients(&clients, &[client_id]);
+    if let Some(index) = subscribed {
+        remove_clients(&relays[index].clients, &[client_id]);
+    }
     Ok(())
+}
+
+/// Picks the stream addressed by an RTSP request URI. A single-stream camera keeps accepting
+/// any path (as it always did); with several streams an unknown path is a 404, like a real camera.
+fn find_stream(relays: &[Arc<StreamRelay>], uri: &str) -> Option<usize> {
+    if relays.len() == 1 {
+        return Some(0);
+    }
+
+    let path = uri_path(uri);
+    relays.iter().position(|relay| {
+        path == relay.stream.rtsp_path || path.starts_with(&format!("{}/", relay.stream.rtsp_path))
+    })
+}
+
+/// Path part of an RTSP URI, without leading/trailing slashes, query or fragment.
+fn uri_path(uri: &str) -> &str {
+    let rest = uri.split_once("://").map_or(uri, |(_, rest)| rest);
+    let path = rest.find('/').map_or("", |index| &rest[index..]);
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    path.trim_matches('/')
 }
 
 fn setup_transport(
@@ -389,7 +446,7 @@ fn setup_transport(
     writer: Arc<Mutex<TcpStream>>,
     rtp_socket: Arc<UdpSocket>,
     rtcp_socket: Arc<UdpSocket>,
-    config: &Config,
+    stream: &Stream,
 ) -> Option<(ClientSink, String)> {
     if transport.to_ascii_uppercase().contains("RTP/AVP/TCP")
         || transport.to_ascii_lowercase().contains("interleaved")
@@ -430,8 +487,8 @@ fn setup_transport(
         },
         format!(
             "RTP/AVP;unicast;client_port={client_rtp}-{client_rtcp};server_port={}-{}",
-            config.rtp_port,
-            config.rtp_port + 1
+            stream.rtp_port,
+            stream.rtp_port + 1
         ),
     ))
 }
@@ -456,7 +513,7 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> io::Result<Option<RtspRequ
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing RTSP method"))?
         .to_string();
-    let _uri = parts
+    let uri = parts
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing RTSP URI"))?
         .to_string();
@@ -485,7 +542,11 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> io::Result<Option<RtspRequ
         reader.read_exact(&mut body)?;
     }
 
-    Ok(Some(RtspRequest { method, headers }))
+    Ok(Some(RtspRequest {
+        method,
+        uri,
+        headers,
+    }))
 }
 
 fn write_response(
@@ -550,7 +611,9 @@ fn remove_clients(clients: &Clients, ids: &[u64]) {
 
 fn parse_interleaved(transport: &str) -> Option<(u8, u8)> {
     for part in transport.split(';') {
-        let (name, value) = part.trim().split_once('=')?;
+        let Some((name, value)) = part.trim().split_once('=') else {
+            continue;
+        };
         if name.eq_ignore_ascii_case("interleaved") {
             let (rtp, rtcp) = value.split_once('-')?;
             return Some((rtp.parse().ok()?, rtcp.parse().ok()?));
@@ -562,7 +625,9 @@ fn parse_interleaved(transport: &str) -> Option<(u8, u8)> {
 
 fn parse_client_ports(transport: &str) -> Option<(u16, u16)> {
     for part in transport.split(';') {
-        let (name, value) = part.trim().split_once('=')?;
+        let Some((name, value)) = part.trim().split_once('=') else {
+            continue;
+        };
         if name.eq_ignore_ascii_case("client_port") {
             let (rtp, rtcp) = value.split_once('-')?;
             return Some((rtp.parse().ok()?, rtcp.parse().ok()?));
@@ -572,7 +637,7 @@ fn parse_client_ports(transport: &str) -> Option<(u16, u16)> {
     None
 }
 
-fn sdp(config: &Config) -> String {
+fn sdp(config: &Config, stream: &Stream) -> String {
     let name = config
         .camera_name
         .replace(['\r', '\n'], " ")
@@ -591,6 +656,75 @@ fn sdp(config: &Config) -> String {
          a=fmtp:96 packetization-mode=1;profile-level-id=42e01f\r\n\
          a=framerate:{}\r\n\
          a=control:trackID=0\r\n",
-        config.fps
+        stream.fps
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn relay(path: &str, port: u16) -> Arc<StreamRelay> {
+        Arc::new(StreamRelay {
+            stream: Stream {
+                name: "x",
+                rtsp_path: path.to_string(),
+                width: 2,
+                height: 2,
+                fps: 1,
+                bitrate_kbps: 1,
+                rtp_port: port,
+                codec: String::new(),
+                preset: None,
+            },
+            clients: Arc::new(Mutex::new(Vec::new())),
+            rtp_socket: Arc::new(UdpSocket::bind(("127.0.0.1", 0)).unwrap()),
+            rtcp_socket: Arc::new(UdpSocket::bind(("127.0.0.1", 0)).unwrap()),
+        })
+    }
+
+    #[test]
+    fn uri_path_strips_scheme_host_query_and_slashes() {
+        assert_eq!(uri_path("rtsp://10.0.0.1:8554/live/"), "live");
+        assert_eq!(
+            uri_path("rtsp://10.0.0.1:8554/live_sub/trackID=0"),
+            "live_sub/trackID=0"
+        );
+        assert_eq!(uri_path("rtsp://h/live?x=1"), "live");
+        assert_eq!(uri_path("rtsp://h"), "");
+    }
+
+    #[test]
+    fn routes_by_path_and_rejects_unknown_when_multi_stream() {
+        let relays = [relay("live", 1), relay("live_sub", 3)];
+        assert_eq!(find_stream(&relays, "rtsp://h:1/live"), Some(0));
+        assert_eq!(find_stream(&relays, "rtsp://h:1/live/trackID=0"), Some(0));
+        assert_eq!(find_stream(&relays, "rtsp://h:1/live_sub"), Some(1));
+        assert_eq!(
+            find_stream(&relays, "rtsp://h:1/live_sub/trackID=0"),
+            Some(1)
+        );
+        assert_eq!(find_stream(&relays, "rtsp://h:1/other"), None);
+    }
+
+    #[test]
+    fn transport_parsers_skip_parts_without_equals() {
+        assert_eq!(
+            parse_interleaved("RTP/AVP/TCP;unicast;interleaved=2-3"),
+            Some((2, 3))
+        );
+        assert_eq!(
+            parse_client_ports("RTP/AVP/UDP;unicast;client_port=5000-5001"),
+            Some((5000, 5001))
+        );
+        assert_eq!(parse_client_ports("RTP/AVP/UDP;unicast"), None);
+    }
+
+    #[test]
+    fn single_stream_accepts_any_path() {
+        assert_eq!(
+            find_stream(&[relay("live", 1)], "rtsp://h:1/whatever"),
+            Some(0)
+        );
+    }
 }

@@ -154,6 +154,10 @@ struct Cli {
     /// Disable WS-Discovery.
     #[arg(long = "no-discovery")]
     no_discovery: bool,
+
+    /// Write a JSON description of the configured cameras to this file ("-" for stdout) and exit.
+    #[arg(long = "export-cameras", value_name = "PATH")]
+    export_cameras: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -191,20 +195,31 @@ struct TomlCamera {
     no_discovery: Option<bool>,
 }
 
-pub fn load_from_env() -> Result<Vec<Config>, String> {
-    let cli = Cli::parse();
+pub struct Startup {
+    pub configs: Vec<Config>,
+    pub export_cameras: Option<PathBuf>,
+}
 
-    if let Some(path) = cli.config.as_deref() {
+pub fn load_from_env() -> Result<Startup, String> {
+    let cli = Cli::parse();
+    let export_cameras = cli.export_cameras.clone();
+
+    let configs = if let Some(path) = cli.config.as_deref() {
         let mut configs = load_from_toml(path)?;
         if let Some(host) = &cli.advertise_host {
             for config in &mut configs {
                 config.advertise_host = host.clone();
             }
         }
-        Ok(configs)
+        configs
     } else {
-        Ok(vec![cli.into()])
-    }
+        vec![cli.into()]
+    };
+
+    Ok(Startup {
+        configs,
+        export_cameras,
+    })
 }
 
 impl From<Cli> for Config {

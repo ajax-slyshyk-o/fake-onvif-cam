@@ -29,7 +29,7 @@ cargo test
 cargo clippy
 ```
 
-There is no test suite yet — `cargo test` runs only doctests.
+There is only a small unit-test suite (`export.rs`, `util.rs`).
 
 ## Architecture
 
@@ -60,7 +60,8 @@ main thread
 | `http.rs` | Minimal HTTP server: routes `/`, `/snapshot.jpg`, `/onvif/device_service`, `/onvif/media_service` |
 | `rtsp.rs` | Custom RTSP server + RTP/RTCP relay; supports both TCP-interleaved and UDP-unicast transport |
 | `ffmpeg.rs` | Spawns/supervises ffmpeg subprocess; builds drawtext filter for overlay; handles platform fonts |
-| `util.rs` | UUID v4 generation, XML escaping, UTC timestamp helpers |
+| `export.rs` | `--export-cameras`: writes the resolved camera list as JSON and exits |
+| `util.rs` | UUID v4 generation, XML/JSON escaping, UTC timestamp helpers |
 
 ## Key Design Decisions
 

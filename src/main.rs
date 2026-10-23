@@ -1,5 +1,6 @@
 mod config;
 mod discovery;
+mod export;
 mod ffmpeg;
 mod http;
 mod onvif;
@@ -17,13 +18,28 @@ enum RuntimeEvent {
 }
 
 fn main() -> process::ExitCode {
-    let configs = match config::load_from_env() {
-        Ok(configs) => configs,
+    let startup = match config::load_from_env() {
+        Ok(startup) => startup,
         Err(err) => {
             eprintln!("error: {err}");
             return process::ExitCode::from(2);
         }
     };
+
+    if let Some(target) = &startup.export_cameras {
+        return match export::write(target, &startup.configs) {
+            Ok(()) => process::ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!(
+                    "error: failed to export cameras to {}: {err}",
+                    target.display()
+                );
+                process::ExitCode::from(2)
+            }
+        };
+    }
+
+    let configs = startup.configs;
 
     let configs: Vec<_> = configs
         .into_iter()

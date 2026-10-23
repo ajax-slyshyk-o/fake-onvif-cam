@@ -133,7 +133,26 @@ All options available on the command line can also be set in the TOML `[defaults
 --no-overlay              Disable video text overlay.
 --no-ffmpeg               Start only ONVIF services and do not launch ffmpeg.
 --no-discovery            Disable WS-Discovery listener.
+--export-cameras <path>   Write the configured cameras as JSON ("-" for stdout) and exit.
 ```
+
+## Export the camera list
+
+`--export-cameras` prints the resolved camera list (name, UUID, advertise host, HTTP port) as JSON and exits without starting any services. Other tools can use it to register the fake cameras elsewhere:
+
+```powershell
+cargo run -- --config cameras.toml --export-cameras cameras.json
+```
+
+```json
+{
+  "cameras": [
+    { "name": "Fake Camera 01", "uuid": "00000000-0000-4550-98a8-98a80cab1b88", "advertise_host": "192.168.1.50", "http_port": 8000 }
+  ]
+}
+```
+
+UUIDs that were not set in the config or with `--uuid` are generated on every run, so the exported UUIDs would not match a later run. Set them explicitly when you export.
 
 ## Firewall notes
 

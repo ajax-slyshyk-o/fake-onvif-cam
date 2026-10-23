@@ -20,6 +20,24 @@ pub fn xml_escape(value: &str) -> String {
     escaped
 }
 
+pub fn json_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+
+    for ch in value.chars() {
+        match ch {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            ch if (ch as u32) < 0x20 => escaped.push_str(&format!("\\u{:04x}", ch as u32)),
+            _ => escaped.push(ch),
+        }
+    }
+
+    escaped
+}
+
 pub fn make_uuid() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -83,4 +101,14 @@ fn civil_from_days(days_since_unix_epoch: i64) -> (i64, i64, i64) {
     }
 
     (year, month, day)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::json_escape;
+
+    #[test]
+    fn json_escape_handles_quotes_backslashes_and_control_chars() {
+        assert_eq!(json_escape("a\"b\\c\nd\u{1}é"), "a\\\"b\\\\c\\nd\\u0001é");
+    }
 }

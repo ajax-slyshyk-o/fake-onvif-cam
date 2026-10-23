@@ -10,6 +10,8 @@ scale = false
 manufacturer = "Codex Labs"
 model = "FakeCam Rust"
 overlay_font_size = 32
+codec = "libx264"
+preset = "ultrafast"
 
 [[cameras]]
 name = "Fake Camera 01"

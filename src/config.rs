@@ -58,9 +58,9 @@ struct Cli {
     #[arg(long = "config")]
     config: Option<PathBuf>,
 
-    /// Host or IP placed in ONVIF and RTSP URLs.
-    #[arg(long = "advertise-host", default_value_t = default_advertise_host())]
-    advertise_host: String,
+    /// Host or IP placed in ONVIF and RTSP URLs. Overrides `advertise_host` from the config file when both are given.
+    #[arg(long = "advertise-host")]
+    advertise_host: Option<String>,
 
     /// HTTP bind address.
     #[arg(long = "http", default_value = "0.0.0.0:8000")]
@@ -195,7 +195,13 @@ pub fn load_from_env() -> Result<Vec<Config>, String> {
     let cli = Cli::parse();
 
     if let Some(path) = cli.config.as_deref() {
-        load_from_toml(path)
+        let mut configs = load_from_toml(path)?;
+        if let Some(host) = &cli.advertise_host {
+            for config in &mut configs {
+                config.advertise_host = host.clone();
+            }
+        }
+        Ok(configs)
     } else {
         Ok(vec![cli.into()])
     }
@@ -215,7 +221,7 @@ impl From<Cli> for Config {
             camera_name: cli.camera_name,
             uuid: cli.uuid.unwrap_or_else(util::make_uuid),
             http_addr: cli.http_addr,
-            advertise_host: cli.advertise_host,
+            advertise_host: cli.advertise_host.unwrap_or_else(default_advertise_host),
             rtsp_port: cli.rtsp_port,
             rtsp_path: cli.rtsp_path,
             rtp_port: cli.rtp_port,

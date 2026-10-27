@@ -1,5 +1,6 @@
 use crate::config::{Config, MediaInput, Stream};
 use std::io;
+use std::net::UdpSocket;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -267,10 +268,31 @@ fn split_filter_graph(vfilters: &[String], sub: &Stream) -> String {
     )
 }
 
+/// Finds an even-numbered local UDP port `p` such that both `p` and `p + 1` are currently free.
+fn free_local_port_pair() -> Option<u16> {
+    for _ in 0..50 {
+        let first = UdpSocket::bind(("127.0.0.1", 0)).ok()?;
+        let port = first.local_addr().ok()?.port();
+        if port == u16::MAX {
+            continue;
+        }
+        if UdpSocket::bind(("127.0.0.1", port + 1)).is_ok() {
+            return Some(port);
+        }
+    }
+    None
+}
+
 /// Output options for one stream: encoder, rate control and the RTP destination.
 fn add_output(command: &mut Command, stream: &Stream, ssrc: u32) {
+    // Without explicit local ports ffmpeg binds an ephemeral RTP port and then RTCP at +1
+    // blindly, which fails with "bind failed" (WSAEADDRINUSE on Windows) when many ffmpeg
+    // processes start at once.
+    let local = free_local_port_pair()
+        .map(|port| format!("&localport={}&localrtcpport={}", port, port + 1))
+        .unwrap_or_default();
     let rtp_url = format!(
-        "rtp://127.0.0.1:{}?rtcpport={}&pkt_size=1200",
+        "rtp://127.0.0.1:{}?rtcpport={}&pkt_size=1200{local}",
         stream.rtp_port,
         stream.rtp_port + 1
     );

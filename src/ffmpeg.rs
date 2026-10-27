@@ -3,7 +3,7 @@ use std::io;
 use std::net::UdpSocket;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -268,15 +268,27 @@ fn split_filter_graph(vfilters: &[String], sub: &Stream) -> String {
     )
 }
 
-/// Finds an even-numbered local UDP port `p` such that both `p` and `p + 1` are currently free.
+/// Local source ports for ffmpeg's RTP/RTCP sockets are taken from this range, below the
+/// OS ephemeral range (49152+ on Windows, 32768+ on Linux).
+const LOCAL_PORT_BASE: u16 = 20000;
+const LOCAL_PORT_PAIRS: u32 = 5000;
+
+/// Finds a local UDP port `p` such that both `p` and `p + 1` are currently free.
+///
+/// ffmpeg binds the ports seconds after they are probed (encoder start-up), so the pair must
+/// not come from the OS ephemeral range: the OS hands a just-released port to the next
+/// ephemeral bind, and any process (another ffmpeg, a browser) can take it in that window.
+/// Pairs are handed out from a process-wide counter instead, so pairs never overlap, whether
+/// they belong to two streams of one ffmpeg or to cameras starting or restarting concurrently.
 fn free_local_port_pair() -> Option<u16> {
-    for _ in 0..50 {
-        let first = UdpSocket::bind(("127.0.0.1", 0)).ok()?;
-        let port = first.local_addr().ok()?.port();
-        if port == u16::MAX {
-            continue;
-        }
-        if UdpSocket::bind(("127.0.0.1", port + 1)).is_ok() {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+
+    for _ in 0..LOCAL_PORT_PAIRS {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed) % LOCAL_PORT_PAIRS;
+        let port = LOCAL_PORT_BASE + (n * 2) as u16;
+        if UdpSocket::bind(("127.0.0.1", port)).is_ok()
+            && UdpSocket::bind(("127.0.0.1", port + 1)).is_ok()
+        {
             return Some(port);
         }
     }
@@ -441,6 +453,17 @@ mod tests {
             rtp_port: 6004,
             codec: "libx264".to_string(),
             preset: None,
+        }
+    }
+
+    #[test]
+    fn free_port_pairs_are_distinct_across_calls() {
+        let pairs: Vec<u16> = (0..20).filter_map(|_| free_local_port_pair()).collect();
+        assert_eq!(pairs.len(), 20);
+        for (i, a) in pairs.iter().enumerate() {
+            for b in &pairs[i + 1..] {
+                assert!(a.abs_diff(*b) >= 2, "overlapping pairs {a} and {b}: {pairs:?}");
+            }
         }
     }
 

@@ -70,6 +70,26 @@ pub struct SubStream {
     pub preset: Option<String>,
 }
 
+/// Video format a stream is published in (RTP payload, SDP and ONVIF encoding).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoFormat {
+    H264,
+    H265,
+}
+
+impl VideoFormat {
+    /// Format produced by an ffmpeg encoder name: `libx265`, `hevc_nvenc`, `hevc_qsv`, ...
+    /// are HEVC, everything else is treated as H.264.
+    pub fn of_encoder(codec: &str) -> Self {
+        let codec = codec.to_ascii_lowercase();
+        if codec.contains("265") || codec.contains("hevc") {
+            VideoFormat::H265
+        } else {
+            VideoFormat::H264
+        }
+    }
+}
+
 /// A fully resolved stream published by a camera.
 #[derive(Clone, Debug)]
 pub struct Stream {
@@ -82,6 +102,32 @@ pub struct Stream {
     pub rtp_port: u16,
     pub codec: String,
     pub preset: Option<String>,
+}
+
+impl Stream {
+    pub fn format(&self) -> VideoFormat {
+        VideoFormat::of_encoder(&self.codec)
+    }
+}
+
+impl Config {
+    /// True when any stream of this camera is published as H.265.
+    pub fn has_hevc(&self) -> bool {
+        self.streams()
+            .iter()
+            .any(|stream| stream.format() == VideoFormat::H265)
+    }
+}
+
+/// HEVC is only wired up for sub streams for now: the main stream stays H.264.
+fn validate_main_codec(codec: &str) -> Result<(), String> {
+    if VideoFormat::of_encoder(codec) == VideoFormat::H265 {
+        Err(format!(
+            "codec \"{codec}\" is HEVC, which is only supported for the sub stream (use sub_codec / --sub-codec)"
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 const SUB_DEFAULT_HEIGHT: u32 = 240;
@@ -335,7 +381,8 @@ struct Cli {
     #[arg(long = "sub-rtp-port", value_parser = parse_rtp_port)]
     sub_rtp_port: Option<u16>,
 
-    /// Sub-stream encoder. Defaults to libx264.
+    /// Sub-stream encoder. Defaults to libx264. HEVC encoders (libx265, hevc_nvenc, ...) publish
+    /// the sub stream as H.265.
     #[arg(long = "sub-codec")]
     sub_codec: Option<String>,
 
@@ -434,6 +481,7 @@ impl TryFrom<Cli> for Config {
     type Error = String;
 
     fn try_from(cli: Cli) -> Result<Self, String> {
+        validate_main_codec(&cli.codec)?;
         let sub = SubOptions {
             enabled: cli.sub_stream,
             width: cli.sub_width,
@@ -562,6 +610,8 @@ fn camera_from_toml(
         "bitrate",
         index,
     )?;
+    let codec = choose_string(&camera.codec, &defaults.codec, "libx264");
+    validate_main_codec(&codec).map_err(|err| format!("camera {}: {err}", index + 1))?;
     let media_input = choose_optional_path(&camera.file, &defaults.file)
         .map(|path| MediaInput::File(resolve_config_path(base_dir, path)))
         .unwrap_or(MediaInput::TestPattern);
@@ -593,7 +643,7 @@ fn camera_from_toml(
         height,
         fps,
         bitrate_kbps,
-        codec: choose_string(&camera.codec, &defaults.codec, "libx264"),
+        codec,
         preset: choose_optional_string(&camera.preset, &defaults.preset),
         manufacturer: choose_string(&camera.manufacturer, &defaults.manufacturer, "Codex Labs"),
         model: choose_string(&camera.model, &defaults.model, "FakeCam Rust"),
@@ -913,6 +963,39 @@ mod tests {
         assert_eq!(streams[1].fps, config.fps);
         assert_eq!(streams[1].bitrate_kbps, 512);
         assert_eq!(streams[1].codec, "libx264");
+    }
+
+    #[test]
+    fn encoder_names_map_to_video_format() {
+        for codec in ["libx265", "hevc_nvenc", "hevc_qsv", "hevc_amf", "LIBX265"] {
+            assert_eq!(VideoFormat::of_encoder(codec), VideoFormat::H265, "{codec}");
+        }
+        for codec in ["libx264", "h264_nvenc", "h264_qsv", "h264_amf"] {
+            assert_eq!(VideoFormat::of_encoder(codec), VideoFormat::H264, "{codec}");
+        }
+    }
+
+    #[test]
+    fn hevc_is_allowed_for_sub_but_not_main() {
+        let hevc_sub = SubOptions {
+            enabled: true,
+            codec: Some("libx265".to_string()),
+            ..SubOptions::default()
+        }
+        .into_sub_stream()
+        .unwrap()
+        .unwrap();
+        let config = Config {
+            sub: Some(hevc_sub),
+            ..Config::default()
+        };
+        let streams = config.streams();
+        assert_eq!(streams[0].format(), VideoFormat::H264);
+        assert_eq!(streams[1].format(), VideoFormat::H265);
+
+        assert!(validate_main_codec("libx264").is_ok());
+        assert!(validate_main_codec("libx265").is_err());
+        assert!(validate_main_codec("hevc_nvenc").is_err());
     }
 
     #[test]

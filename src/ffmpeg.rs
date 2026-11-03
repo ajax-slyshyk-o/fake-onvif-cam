@@ -334,7 +334,8 @@ fn add_output(command: &mut Command, stream: &Stream, ssrc: u32) {
 }
 
 /// Encoder-specific arguments. The RTSP SDP carries no sprop-parameter-sets, so every
-/// encoder must repeat SPS/PPS in-band on keyframes.
+/// encoder must repeat SPS/PPS (VPS/SPS/PPS for HEVC) in-band on keyframes. Encoders without
+/// a dedicated branch (e.g. `hevc_nvenc`) use the generic one, which relies on `dump_extra`.
 fn add_encoder_args(command: &mut Command, codec: &str, preset: Option<&str>) {
     command.arg("-c:v").arg(codec);
 
@@ -349,6 +350,22 @@ fn add_encoder_args(command: &mut Command, codec: &str, preset: Option<&str>) {
                 .arg("zerolatency")
                 .arg("-x264-params")
                 .arg("repeat-headers=1")
+                .arg("-pix_fmt")
+                .arg("yuv420p");
+        }
+        // HEVC: no baseline profile, and x265 needs its own parameter syntax to repeat
+        // VPS/SPS/PPS on every keyframe. Closed GOPs (IDR instead of CRA) keep every
+        // keyframe a clean random-access point for clients that join mid-stream.
+        "libx265" => {
+            command
+                .arg("-profile:v")
+                .arg("main")
+                .arg("-preset")
+                .arg(preset.unwrap_or("veryfast"))
+                .arg("-tune")
+                .arg("zerolatency")
+                .arg("-x265-params")
+                .arg("repeat-headers=1:open-gop=0")
                 .arg("-pix_fmt")
                 .arg("yuv420p");
         }
@@ -454,6 +471,31 @@ mod tests {
             codec: "libx264".to_string(),
             preset: None,
         }
+    }
+
+    fn encoder_args(codec: &str, preset: Option<&str>) -> Vec<String> {
+        let mut command = Command::new("ffmpeg");
+        add_encoder_args(&mut command, codec, preset);
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn libx265_repeats_headers_in_band() {
+        let args = encoder_args("libx265", None).join(" ");
+        assert!(args.starts_with("-c:v libx265 "), "{args}");
+        assert!(args.contains("-profile:v main"), "{args}");
+        assert!(args.contains("-preset veryfast"), "{args}");
+        assert!(args.contains("-x265-params repeat-headers=1:open-gop=0"), "{args}");
+        assert!(!args.contains("baseline"), "{args}");
+    }
+
+    #[test]
+    fn libx265_honours_preset() {
+        let args = encoder_args("libx265", Some("ultrafast")).join(" ");
+        assert!(args.contains("-preset ultrafast"), "{args}");
     }
 
     #[test]

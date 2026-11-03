@@ -62,7 +62,15 @@ fn handle_client(mut stream: TcpStream, config: Arc<Config>) -> io::Result<()> {
         ("POST", "/onvif/device_service") | ("POST", "/onvif/media_service") => {
             soap_response_for(&request.body, &config)
         }
-        ("GET", "/onvif/device_service") | ("GET", "/onvif/media_service") => {
+        // Media2 exists only on cameras that publish an H.265 stream.
+        ("POST", "/onvif/media2_service") if config.has_hevc() => {
+            let operation = onvif::detect_operation(&request.body);
+            let xml = onvif::soap_response_media2(operation.as_deref(), &config, &request.body);
+            binary_response(200, "application/soap+xml; charset=utf-8", xml.as_bytes())
+        }
+        ("GET", "/onvif/device_service")
+        | ("GET", "/onvif/media_service")
+        | ("GET", "/onvif/media2_service") => {
             text_response(200, status_text(200), landing_text(&config))
         }
         _ => text_response(404, status_text(404), "not found\n".to_string()),
@@ -127,9 +135,12 @@ fn soap_response_for(body: &str, config: &Config) -> Vec<u8> {
 
 fn landing_text(config: &Config) -> String {
     format!(
-        "fake-onvif-cam\n\nDevice service: {}\nMedia service: {}\n{}Snapshot: {}\n",
+        "fake-onvif-cam\n\nDevice service: {}\nMedia service: {}\n{}{}Snapshot: {}\n",
         onvif::device_xaddr(config),
         onvif::media_xaddr(config),
+        onvif::media2_xaddr(config)
+            .map(|xaddr| format!("Media2 service: {xaddr}\n"))
+            .unwrap_or_default(),
         config
             .streams()
             .iter()

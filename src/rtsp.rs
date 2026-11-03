@@ -1,4 +1,4 @@
-use crate::config::{Config, Stream};
+use crate::config::{Config, Stream, VideoFormat};
 use crate::onvif;
 use crate::util;
 use std::collections::HashMap;
@@ -644,6 +644,15 @@ fn sdp(config: &Config, stream: &Stream) -> String {
         .trim()
         .to_string();
 
+    // No sprop-* parameter sets in either format: the encoders repeat them in-band.
+    let codec_lines = match stream.format() {
+        VideoFormat::H264 => {
+            "a=rtpmap:96 H264/90000\r\n\
+             a=fmtp:96 packetization-mode=1;profile-level-id=42e01f\r\n"
+        }
+        VideoFormat::H265 => "a=rtpmap:96 H265/90000\r\n",
+    };
+
     format!(
         "v=0\r\n\
          o=- 0 0 IN IP4 0.0.0.0\r\n\
@@ -652,8 +661,7 @@ fn sdp(config: &Config, stream: &Stream) -> String {
          t=0 0\r\n\
          a=control:*\r\n\
          m=video 0 RTP/AVP 96\r\n\
-         a=rtpmap:96 H264/90000\r\n\
-         a=fmtp:96 packetization-mode=1;profile-level-id=42e01f\r\n\
+         {codec_lines}\
          a=framerate:{}\r\n\
          a=control:trackID=0\r\n",
         stream.fps
@@ -681,6 +689,23 @@ mod tests {
             rtp_socket: Arc::new(UdpSocket::bind(("127.0.0.1", 0)).unwrap()),
             rtcp_socket: Arc::new(UdpSocket::bind(("127.0.0.1", 0)).unwrap()),
         })
+    }
+
+    #[test]
+    fn sdp_describes_h264_and_h265_streams() {
+        let config = Config::default();
+        let mut stream = relay("live", 1).stream.clone();
+
+        let h264 = sdp(&config, &stream);
+        assert!(h264.contains("a=rtpmap:96 H264/90000\r\n"));
+        assert!(h264.contains("a=fmtp:96 packetization-mode=1;profile-level-id=42e01f\r\n"));
+
+        stream.codec = "libx265".to_string();
+        let h265 = sdp(&config, &stream);
+        assert!(h265.contains("a=rtpmap:96 H265/90000\r\n"));
+        assert!(!h265.contains("H264"));
+        assert!(!h265.contains("packetization-mode"));
+        assert!(h265.contains("a=framerate:1\r\na=control:trackID=0\r\n"));
     }
 
     #[test]

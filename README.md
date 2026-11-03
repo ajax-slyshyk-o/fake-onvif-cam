@@ -82,9 +82,28 @@ The camera then advertises two ONVIF profiles (`profile_1` main, `profile_2` sub
 | `--sub-bitrate` | `sub_bitrate` | `512` kbit/s |
 | `--sub-rtsp-path` | `sub_rtsp_path` | `live_sub` |
 | `--sub-rtp-port` | `sub_rtp_port` | `rtp_port + 1000` (RTCP is the next port) |
-| `--sub-codec`, `--sub-preset` | `sub_codec`, `sub_preset` | `libx264`, codec default |
+| `--sub-codec`, `--sub-preset` | `sub_codec`, `sub_preset` | `libx264`, codec default (`libx265` publishes H.265, see below) |
 
 The sub stream uses software `libx264` by default even when the main stream uses a hardware encoder, so a camera does not take a second NVENC session (consumer GPUs limit concurrent sessions). `sub_*` options without `sub_stream = true` are rejected. Sub-stream UDP ports take part in the fleet port-collision check.
+
+### H.265 (HEVC) sub stream
+
+Set `sub_codec` (or `--sub-codec`) to an HEVC encoder to publish the sub stream as H.265 while the main stream stays H.264:
+
+```toml
+[[cameras]]
+name = "Fake Camera 01"
+sub_stream = true
+sub_codec = "libx265"   # sub stream is H.265, main stream is H.264
+sub_preset = "ultrafast"
+```
+
+The format follows the encoder name: `libx265` and any `hevc_*` encoder (`hevc_nvenc`, `hevc_qsv`, `hevc_amf`) are HEVC. For such a stream the RTSP SDP uses `a=rtpmap:96 H265/90000` (RFC 7798) and the ONVIF Media2 service reports `<tt:Encoding>H265</tt:Encoding>` for that profile.
+
+- `libx265` is configured with Main profile, `zerolatency` tune, `veryfast` default preset, and in-band VPS/SPS/PPS plus closed GOPs on every keyframe. `hevc_*` hardware encoders use the generic settings (`dump_extra` on keyframes) and are untested.
+- ONVIF Media1 (`ver10`) cannot describe H.265, so, like real cameras, Media1 reports the HEVC sub profile as H.264 Baseline. A camera with an HEVC stream additionally serves Media2 (`ver20`) at `/onvif/media2_service`, announced in `GetServices`; there the sub profile is `H265` (Main profile) and the main profile `H264`. Media2 implements `GetProfiles`, `GetVideoSourceConfigurations`, `GetVideoEncoderConfigurations`, `GetVideoEncoderConfigurationOptions`, `GetStreamUri`, `GetSnapshotUri`, `GetServiceCapabilities` and `SetSynchronizationPoint`. Cameras without an HEVC stream do not offer Media2, so they behave as before. An NVR that only uses Media1 will see an H.264 profile and fail to decode the H.265 RTSP stream.
+- HEVC is rejected for the main stream (`codec` / `--codec`) with a clear error; it is only wired up for sub streams for now.
+- Check that your ffmpeg build has the encoder (`ffmpeg -encoders | findstr 265`). Clients and NVRs need HEVC decoding to view the sub stream.
 
 ## Bitrate, codec and preset
 
@@ -97,6 +116,7 @@ The encoder settings are independent of `--scale`:
 | Codec | Runs on | Default preset | Notes |
 |-------|---------|----------------|-------|
 | `libx264` | CPU | `veryfast` | Use `ultrafast` to cut CPU load further. |
+| `libx265` | CPU | `veryfast` | HEVC, sub stream only (`sub_codec`). See [H.265 sub stream](#h265-hevc-sub-stream). |
 | `h264_nvenc` | NVIDIA GPU | `p2` | Presets `p1` (fastest) to `p7`. Consumer GPUs limit the number of simultaneous NVENC sessions (depends on the driver). |
 | `h264_qsv` | Intel GPU | `veryfast` | Needs the Intel iGPU to be enabled. |
 | `h264_amf` | AMD GPU | `speed` | `-quality` is set from the preset: `speed`, `balanced` or `quality`. |
@@ -189,6 +209,7 @@ Ready-made examples in the repository:
 --codec <encoder>         ffmpeg H.264 encoder: libx264, h264_nvenc, h264_qsv, h264_amf, ... Default: libx264
 --preset <name>           Encoder preset. Default depends on the codec (libx264: veryfast, h264_nvenc: p2).
 --sub-stream              Also publish a low-resolution sub stream (see Sub stream).
+--sub-codec <encoder>     Sub-stream encoder. Default: libx264. HEVC encoders (libx265, ...) publish H.265.
 --overlay-text <text>     Text burned into the video. Default: camera name.
 --overlay-font <path>     Font file used for the overlay. Default: a platform system font.
 --overlay-font-size <px>  Overlay font size. Default: 32

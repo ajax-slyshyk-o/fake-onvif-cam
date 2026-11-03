@@ -98,6 +98,9 @@ fn main() -> process::ExitCode {
         println!("uuid: {}", config.uuid);
         println!("device service: {}", onvif::device_xaddr(config));
         println!("media service: {}", onvif::media_xaddr(config));
+        if let Some(xaddr) = onvif::media2_xaddr(config) {
+            println!("media2 service: {xaddr}");
+        }
         for stream in config.streams() {
             println!(
                 "rtsp {} stream: {}  ({}x{} @ {}fps, {}k {})",

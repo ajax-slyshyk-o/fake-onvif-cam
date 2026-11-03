@@ -58,7 +58,7 @@ With `sub_stream = true` a camera has two streams (`Config::streams()`: main fir
 |------|----------------|
 | `config.rs` | CLI (`clap`) + TOML parsing, `Config::streams()` (main/sub resolution), fleet validation, host auto-detection |
 | `discovery.rs` | WS-Discovery: parse UDP Probe, reply with ProbeMatch SOAP |
-| `onvif.rs` | All ONVIF SOAP XML generation (17+ operations for Device + Media services) |
+| `onvif.rs` | All ONVIF SOAP XML generation (17+ operations for Device + Media services); `onvif/media2.rs` is the Media2 service, offered only when a stream is H.265 (Media1 reports HEVC as H.264 Baseline) |
 | `http.rs` | Minimal HTTP server: routes `/`, `/snapshot.jpg`, `/onvif/device_service`, `/onvif/media_service` |
 | `rtsp.rs` | Custom RTSP server + RTP/RTCP relay; supports both TCP-interleaved and UDP-unicast transport |
 | `ffmpeg.rs` | Spawns/supervises ffmpeg subprocess; builds drawtext filter for overlay; handles platform fonts |

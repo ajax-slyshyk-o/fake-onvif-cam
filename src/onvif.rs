@@ -1,3 +1,5 @@
+mod media2;
+
 use crate::config::{Config, Stream};
 use crate::util;
 
@@ -52,6 +54,17 @@ pub fn media_xaddr(config: &Config) -> String {
         config.advertise_host,
         config.http_addr.port()
     )
+}
+
+/// Media2 is only offered when a stream needs it (H.265); H.264-only cameras stay Media1.
+pub fn media2_xaddr(config: &Config) -> Option<String> {
+    config.has_hevc().then(|| {
+        format!(
+            "http://{}:{}/onvif/media2_service",
+            config.advertise_host,
+            config.http_addr.port()
+        )
+    })
 }
 
 pub fn snapshot_uri(config: &Config) -> String {
@@ -167,12 +180,18 @@ pub fn soap_response(operation: Option<&str>, config: &Config, request: &str) ->
     envelope(&body)
 }
 
+/// Response of the Media2 service (`/onvif/media2_service`).
+pub fn soap_response_media2(operation: Option<&str>, config: &Config, request: &str) -> String {
+    envelope(&media2::soap_body(operation, config, request))
+}
+
 fn envelope(body: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
             xmlns:tds="http://www.onvif.org/ver10/device/wsdl"
             xmlns:trt="http://www.onvif.org/ver10/media/wsdl"
+            xmlns:tr2="http://www.onvif.org/ver20/media/wsdl"
             xmlns:tt="http://www.onvif.org/ver10/schema">
   <s:Body>
     {body}
@@ -238,6 +257,19 @@ fn get_device_information(config: &Config) -> String {
 fn get_services(config: &Config) -> String {
     let device = util::xml_escape(&device_xaddr(config));
     let media = util::xml_escape(&media_xaddr(config));
+    let media2 = media2_xaddr(config)
+        .map(|xaddr| {
+            format!(
+                r#"
+  <tds:Service>
+    <tds:Namespace>http://www.onvif.org/ver20/media/wsdl</tds:Namespace>
+    <tds:XAddr>{}</tds:XAddr>
+    <tds:Version><tt:Major>2</tt:Major><tt:Minor>0</tt:Minor></tds:Version>
+  </tds:Service>"#,
+                util::xml_escape(&xaddr)
+            )
+        })
+        .unwrap_or_default();
 
     format!(
         r#"<tds:GetServicesResponse>
@@ -250,7 +282,7 @@ fn get_services(config: &Config) -> String {
     <tds:Namespace>http://www.onvif.org/ver10/media/wsdl</tds:Namespace>
     <tds:XAddr>{media}</tds:XAddr>
     <tds:Version><tt:Major>2</tt:Major><tt:Minor>0</tt:Minor></tds:Version>
-  </tds:Service>
+  </tds:Service>{media2}
 </tds:GetServicesResponse>"#
     )
 }
@@ -366,13 +398,16 @@ fn get_profile(config: &Config, index: usize, stream: &Stream) -> String {
     )
 }
 
-fn profile_xml(config: &Config, index: usize, stream: &Stream) -> String {
-    let name = if index == 0 {
+fn profile_name(config: &Config, index: usize, stream: &Stream) -> String {
+    if index == 0 {
         config.camera_name.clone()
     } else {
         format!("{} {}", config.camera_name, stream.name)
-    };
-    let name = util::xml_escape(&name);
+    }
+}
+
+fn profile_xml(config: &Config, index: usize, stream: &Stream) -> String {
+    let name = util::xml_escape(&profile_name(config, index, stream));
     let token = profile_token(index);
 
     format!(
@@ -470,6 +505,9 @@ fn get_video_encoder_configurations(config: &Config) -> String {
     )
 }
 
+/// Media1 profile encoder configuration. Media1 only knows JPEG/MPEG4/H264, so like the real
+/// cameras this emulates, an HEVC stream is reported here as H.264 Baseline; clients that
+/// understand H.265 read the real encoding from Media2.
 fn video_encoder_configuration_xml(index: usize, stream: &Stream) -> String {
     let token = video_encoder_config_token(index);
     let name = if index == 0 {
@@ -612,6 +650,133 @@ mod tests {
         assert!(xml.contains(r#"token="profile_2""#));
         assert!(xml.contains("<tt:Width>1920</tt:Width>"));
         assert!(xml.contains("<tt:Width>426</tt:Width>"));
+    }
+
+    fn hevc_config() -> Config {
+        let mut config = two_stream_config();
+        config.sub.as_mut().unwrap().codec = "libx265".to_string();
+        config
+    }
+
+    fn media2(operation: &str, config: &Config, body: &str) -> String {
+        soap_response_media2(Some(operation), config, body)
+    }
+
+    #[test]
+    fn media1_reports_hevc_sub_as_h264_baseline() {
+        let config = hevc_config();
+        let profiles = get_profiles(&config);
+        assert!(profiles.contains("<tt:Encoding>H264</tt:Encoding>"));
+        assert!(!profiles.contains("H265"));
+
+        let options = get_video_encoder_configuration_options(&config.streams()[1]);
+        assert!(options.contains("<tt:H264ProfilesSupported>Baseline</tt:H264ProfilesSupported>"));
+        assert!(!options.contains("H265"));
+    }
+
+    #[test]
+    fn media2_is_advertised_only_for_hevc_cameras() {
+        assert!(get_services(&two_stream_config()).find("ver20/media").is_none());
+        assert!(media2_xaddr(&two_stream_config()).is_none());
+
+        let config = hevc_config();
+        let services = get_services(&config);
+        assert!(services.contains("http://www.onvif.org/ver20/media/wsdl"));
+        assert!(services.contains("/onvif/media2_service"));
+        assert!(media2_xaddr(&config).unwrap().ends_with("/onvif/media2_service"));
+    }
+
+    #[test]
+    fn media2_profiles_report_real_encodings() {
+        let xml = media2(
+            "GetProfiles",
+            &hevc_config(),
+            "<tr2:GetProfiles><tr2:Type>All</tr2:Type></tr2:GetProfiles>",
+        );
+        assert!(xml.contains(r#"<tr2:Profiles token="profile_1" fixed="true">"#));
+        assert!(xml.contains(r#"<tr2:Profiles token="profile_2" fixed="true">"#));
+        assert!(xml.contains("<tt:Encoding>H264</tt:Encoding>"));
+        assert!(xml.contains("<tt:Encoding>H265</tt:Encoding>"));
+        assert!(xml.contains(r#"Profile="Main""#));
+        assert!(xml.contains("<tt:Name>H265EncoderSub</tt:Name>"));
+        assert!(xml.contains(r#"xmlns:tr2="http://www.onvif.org/ver20/media/wsdl""#));
+    }
+
+    #[test]
+    fn media2_profiles_can_be_filtered_by_token() {
+        let config = hevc_config();
+        let xml = media2(
+            "GetProfiles",
+            &config,
+            "<tr2:GetProfiles><tr2:Token>profile_2</tr2:Token></tr2:GetProfiles>",
+        );
+        assert!(xml.contains(r#"token="profile_2""#));
+        assert!(!xml.contains(r#"token="profile_1""#));
+
+        let unknown = media2(
+            "GetProfiles",
+            &config,
+            "<tr2:GetProfiles><tr2:Token>nope</tr2:Token></tr2:GetProfiles>",
+        );
+        assert!(unknown.contains("<s:Fault>"));
+    }
+
+    #[test]
+    fn media2_encoder_configurations_and_options() {
+        let config = hevc_config();
+        let all = media2(
+            "GetVideoEncoderConfigurations",
+            &config,
+            "<tr2:GetVideoEncoderConfigurations/>",
+        );
+        assert!(all.contains(r#"<tr2:Configurations token="video_encoder_config_1""#));
+        assert!(all.contains(r#"<tr2:Configurations token="video_encoder_config_2""#));
+
+        let sub = media2(
+            "GetVideoEncoderConfigurations",
+            &config,
+            "<tr2:GetVideoEncoderConfigurations><tr2:ConfigurationToken>video_encoder_config_2</tr2:ConfigurationToken></tr2:GetVideoEncoderConfigurations>",
+        );
+        assert!(sub.contains("<tt:Encoding>H265</tt:Encoding>"));
+        assert!(!sub.contains("<tt:Encoding>H264</tt:Encoding>"));
+
+        let sub_options = media2(
+            "GetVideoEncoderConfigurationOptions",
+            &config,
+            "<tr2:GetVideoEncoderConfigurationOptions><tr2:ProfileToken>profile_2</tr2:ProfileToken></tr2:GetVideoEncoderConfigurationOptions>",
+        );
+        assert!(sub_options.contains("<tt:Encoding>H265</tt:Encoding>"));
+        assert!(sub_options.contains(r#"ProfilesSupported="Main""#));
+        assert!(!sub_options.contains("H264"));
+
+        let all_options = media2(
+            "GetVideoEncoderConfigurationOptions",
+            &config,
+            "<tr2:GetVideoEncoderConfigurationOptions/>",
+        );
+        assert!(all_options.contains("<tt:Encoding>H264</tt:Encoding>"));
+        assert!(all_options.contains("<tt:Encoding>H265</tt:Encoding>"));
+    }
+
+    #[test]
+    fn media2_stream_uri_follows_profile_token() {
+        let config = hevc_config();
+        let body = |token: &str| {
+            format!(
+                "<tr2:GetStreamUri><tr2:Protocol>RTSP</tr2:Protocol><tr2:ProfileToken>{token}</tr2:ProfileToken></tr2:GetStreamUri>"
+            )
+        };
+        let main = media2("GetStreamUri", &config, &body("profile_1"));
+        let sub = media2("GetStreamUri", &config, &body("profile_2"));
+        assert!(main.contains("/live</tr2:Uri>"));
+        assert!(sub.contains("/live_sub</tr2:Uri>"));
+        assert!(media2("GetStreamUri", &config, &body("x")).contains("<s:Fault>"));
+    }
+
+    #[test]
+    fn media2_service_capabilities() {
+        let xml = media2("GetServiceCapabilities", &hevc_config(), "<tr2:GetServiceCapabilities/>");
+        assert!(xml.contains(r#"RTSPStreaming="true""#));
     }
 
     #[test]

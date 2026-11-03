@@ -19,6 +19,8 @@ preset = "ultrafast"
 # Sub stream for every camera: /live_sub, 426x240, 512k, software x264, RTP port = rtp_port + 1000.
 # The NVR can use it for live grids instead of decoding the 1080p main stream.
 sub_stream = true
+sub_fps = 20
+sub_bitrate = 256
 
 [[cameras]]
 name = "Fake Camera 01"

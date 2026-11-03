@@ -21,6 +21,10 @@ preset = "ultrafast"
 sub_stream = true
 sub_fps = 20
 sub_bitrate = 256
+sub_codec = "libx265"
+sub_preset = "ultrafast"
+sub_width = 320
+#sub_height = 576
 
 [[cameras]]
 name = "Fake Camera 01"

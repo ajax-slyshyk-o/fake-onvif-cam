@@ -114,7 +114,12 @@ pub fn start(config: &Config) -> io::Result<Option<FfmpegGuard>> {
         return Ok(None);
     }
 
-    let mut child = spawn_child(config)?;
+    let mut child = spawn_child(config).map_err(|err| {
+        io::Error::other(format!(
+            "failed to spawn `{}`: {err}",
+            config.ffmpeg_path.display()
+        ))
+    })?;
     thread::sleep(Duration::from_millis(250));
 
     if let Some(status) = child.try_wait()? {
@@ -488,7 +493,10 @@ mod tests {
         assert!(args.starts_with("-c:v libx265 "), "{args}");
         assert!(args.contains("-profile:v main"), "{args}");
         assert!(args.contains("-preset veryfast"), "{args}");
-        assert!(args.contains("-x265-params repeat-headers=1:open-gop=0"), "{args}");
+        assert!(
+            args.contains("-x265-params repeat-headers=1:open-gop=0"),
+            "{args}"
+        );
         assert!(!args.contains("baseline"), "{args}");
     }
 
@@ -504,7 +512,10 @@ mod tests {
         assert_eq!(pairs.len(), 20);
         for (i, a) in pairs.iter().enumerate() {
             for b in &pairs[i + 1..] {
-                assert!(a.abs_diff(*b) >= 2, "overlapping pairs {a} and {b}: {pairs:?}");
+                assert!(
+                    a.abs_diff(*b) >= 2,
+                    "overlapping pairs {a} and {b}: {pairs:?}"
+                );
             }
         }
     }

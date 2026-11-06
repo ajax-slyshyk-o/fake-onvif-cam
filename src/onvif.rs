@@ -676,14 +676,18 @@ mod tests {
 
     #[test]
     fn media2_is_advertised_only_for_hevc_cameras() {
-        assert!(get_services(&two_stream_config()).find("ver20/media").is_none());
+        assert!(get_services(&two_stream_config())
+            .find("ver20/media")
+            .is_none());
         assert!(media2_xaddr(&two_stream_config()).is_none());
 
         let config = hevc_config();
         let services = get_services(&config);
         assert!(services.contains("http://www.onvif.org/ver20/media/wsdl"));
         assert!(services.contains("/onvif/media2_service"));
-        assert!(media2_xaddr(&config).unwrap().ends_with("/onvif/media2_service"));
+        assert!(media2_xaddr(&config)
+            .unwrap()
+            .ends_with("/onvif/media2_service"));
     }
 
     #[test]
@@ -775,7 +779,11 @@ mod tests {
 
     #[test]
     fn media2_service_capabilities() {
-        let xml = media2("GetServiceCapabilities", &hevc_config(), "<tr2:GetServiceCapabilities/>");
+        let xml = media2(
+            "GetServiceCapabilities",
+            &hevc_config(),
+            "<tr2:GetServiceCapabilities/>",
+        );
         assert!(xml.contains(r#"RTSPStreaming="true""#));
     }
 

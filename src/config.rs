@@ -450,6 +450,17 @@ struct TomlCamera {
     no_discovery: Option<bool>,
 }
 
+fn ffmpeg_runs(path: &std::path::Path) -> bool {
+    std::process::Command::new(path)
+        .arg("-version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 pub struct Startup {
     pub configs: Vec<Config>,
     pub export_cameras: Option<PathBuf>,
@@ -465,6 +476,18 @@ pub fn load_from_env() -> Result<Startup, String> {
             for config in &mut configs {
                 config.advertise_host = host.clone();
             }
+        }
+        // If the ffmpeg from the config file can't run, fall back to `--ffmpeg`.
+        for config in &mut configs {
+            if config.no_ffmpeg || ffmpeg_runs(&config.ffmpeg_path) {
+                continue;
+            }
+            eprintln!(
+                "warning: ffmpeg `{}` from config can't run; using `{}`",
+                config.ffmpeg_path.display(),
+                cli.ffmpeg_path.display()
+            );
+            config.ffmpeg_path = cli.ffmpeg_path.clone();
         }
         configs
     } else {

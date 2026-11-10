@@ -22,7 +22,10 @@ fn render(configs: &[Config]) -> String {
 
 fn camera_json(config: &Config) -> String {
     let mut credentials = String::new();
-    for (key, value) in [("username", &config.username), ("password", &config.password)] {
+    for (key, value) in [
+        ("username", &config.username),
+        ("password", &config.password),
+    ] {
         if let Some(value) = value {
             credentials.push_str(&format!(
                 ",\n      \"{key}\": \"{}\"",

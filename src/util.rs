@@ -3,6 +3,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static MESSAGE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Percent-encodes everything except RFC 3986 unreserved characters (for URI path segments).
+pub fn percent_encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
 pub fn xml_escape(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
 
@@ -58,7 +71,7 @@ pub fn make_uuid() -> String {
         (value >> 80) as u16,
         (value >> 64) as u16,
         (value >> 48) as u16,
-        value & 0x0000_ffff_ffff_ffff_ffff_u128
+        value & 0xffff_ffff_ffff_u128
     )
 }
 
@@ -105,7 +118,20 @@ fn civil_from_days(days_since_unix_epoch: i64) -> (i64, i64, i64) {
 
 #[cfg(test)]
 mod tests {
-    use super::json_escape;
+    use super::{json_escape, make_uuid, percent_encode};
+
+    #[test]
+    fn generated_uuid_has_canonical_shape() {
+        let uuid = make_uuid();
+        let groups: Vec<usize> = uuid.split('-').map(str::len).collect();
+        assert_eq!(groups, [8, 4, 4, 4, 12], "{uuid}");
+    }
+
+    #[test]
+    fn percent_encode_keeps_unreserved_and_escapes_the_rest() {
+        assert_eq!(percent_encode("FakeCam-1.0_x~"), "FakeCam-1.0_x~");
+        assert_eq!(percent_encode("Fake Cam/é"), "Fake%20Cam%2F%C3%A9");
+    }
 
     #[test]
     fn json_escape_handles_quotes_backslashes_and_control_chars() {

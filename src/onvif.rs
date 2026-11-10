@@ -125,7 +125,13 @@ pub fn detect_operation(xml: &str) -> Option<String> {
 }
 
 pub fn discovery_probe_match(config: &Config, relates_to: &str) -> String {
-    let name = util::xml_escape(&config.camera_name.replace(' ', "_"));
+    let scopes = util::xml_escape(
+        &scope_list(config)
+            .iter()
+            .map(|(_, item)| item.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
     let xaddr = util::xml_escape(&device_xaddr(config));
     let endpoint = util::xml_escape(&format!("urn:uuid:{}", config.uuid));
     let relates_to = util::xml_escape(relates_to);
@@ -150,7 +156,7 @@ pub fn discovery_probe_match(config: &Config, relates_to: &str) -> String {
           <w:Address>{endpoint}</w:Address>
         </w:EndpointReference>
         <d:Types>dn:NetworkVideoTransmitter</d:Types>
-        <d:Scopes>onvif://www.onvif.org/type/video_encoder onvif://www.onvif.org/name/{name} onvif://www.onvif.org/location/TestLab</d:Scopes>
+        <d:Scopes>{scopes}</d:Scopes>
         <d:XAddrs>{xaddr}</d:XAddrs>
         <d:MetadataVersion>1</d:MetadataVersion>
       </d:ProbeMatch>
@@ -305,6 +311,7 @@ fn get_device_information(config: &Config) -> String {
     let model = util::xml_escape(&config.model);
     let firmware = util::xml_escape(&config.firmware);
     let serial = util::xml_escape(&config.serial);
+    let uuid = util::xml_escape(&config.uuid);
 
     format!(
         r#"<tds:GetDeviceInformationResponse>
@@ -312,7 +319,7 @@ fn get_device_information(config: &Config) -> String {
   <tds:Model>{model}</tds:Model>
   <tds:FirmwareVersion>{firmware}</tds:FirmwareVersion>
   <tds:SerialNumber>{serial}</tds:SerialNumber>
-  <tds:HardwareId>fake-onvif-cam</tds:HardwareId>
+  <tds:HardwareId>urn:uuid:{uuid}</tds:HardwareId>
 </tds:GetDeviceInformationResponse>"#
     )
 }
@@ -376,25 +383,38 @@ fn get_system_date_and_time() -> String {
     )
 }
 
-fn get_scopes(config: &Config) -> String {
-    let name = util::xml_escape(&config.camera_name.replace(' ', "_"));
+/// ONVIF scopes as `(definition, uri)`, shared by `GetScopes` and the WS-Discovery ProbeMatch.
+/// `Profile/S` and `Profile/Streaming` are what NVRs usually filter discovery results on.
+fn scope_list(config: &Config) -> Vec<(&'static str, String)> {
+    const BASE: &str = "onvif://www.onvif.org";
+    vec![
+        ("Fixed", format!("{BASE}/Profile/Streaming")),
+        ("Fixed", format!("{BASE}/Profile/S")),
+        ("Fixed", format!("{BASE}/type/video_encoder")),
+        (
+            "Fixed",
+            format!("{BASE}/hardware/{}", util::percent_encode(&config.model)),
+        ),
+        (
+            "Configurable",
+            format!("{BASE}/name/{}", config.camera_name.replace(' ', "_")),
+        ),
+        ("Configurable", format!("{BASE}/location/TestLab")),
+    ]
+}
 
-    format!(
-        r#"<tds:GetScopesResponse>
-  <tds:Scopes>
-    <tt:ScopeDef>Fixed</tt:ScopeDef>
-    <tt:ScopeItem>onvif://www.onvif.org/type/video_encoder</tt:ScopeItem>
-  </tds:Scopes>
-  <tds:Scopes>
-    <tt:ScopeDef>Configurable</tt:ScopeDef>
-    <tt:ScopeItem>onvif://www.onvif.org/name/{name}</tt:ScopeItem>
-  </tds:Scopes>
-  <tds:Scopes>
-    <tt:ScopeDef>Configurable</tt:ScopeDef>
-    <tt:ScopeItem>onvif://www.onvif.org/location/TestLab</tt:ScopeItem>
-  </tds:Scopes>
-</tds:GetScopesResponse>"#
-    )
+fn get_scopes(config: &Config) -> String {
+    let scopes: String = scope_list(config)
+        .iter()
+        .map(|(definition, item)| {
+            format!(
+                "\n  <tds:Scopes>\n    <tt:ScopeDef>{definition}</tt:ScopeDef>\n    <tt:ScopeItem>{}</tt:ScopeItem>\n  </tds:Scopes>",
+                util::xml_escape(item)
+            )
+        })
+        .collect();
+
+    format!("<tds:GetScopesResponse>{scopes}\n</tds:GetScopesResponse>")
 }
 
 fn get_hostname(config: &Config) -> String {
@@ -945,6 +965,42 @@ mod tests {
         assert!(media.contains("<trt:StreamingCapabilities "));
     }
 
+    #[test]
+    fn scopes_include_profile_s_and_match_discovery() {
+        let mut config = two_stream_config();
+        config.camera_name = "Cam 1".to_string();
+        config.model = "Fake Cam".to_string();
+
+        let scopes = get_scopes(&config);
+        for item in [
+            "onvif://www.onvif.org/Profile/Streaming",
+            "onvif://www.onvif.org/Profile/S",
+            "onvif://www.onvif.org/type/video_encoder",
+            "onvif://www.onvif.org/hardware/Fake%20Cam",
+            "onvif://www.onvif.org/name/Cam_1",
+            "onvif://www.onvif.org/location/TestLab",
+        ] {
+            assert!(
+                scopes.contains(&format!("<tt:ScopeItem>{item}</tt:ScopeItem>")),
+                "{item}"
+            );
+            assert!(
+                discovery_probe_match(&config, "uuid:x").contains(item),
+                "{item}"
+            );
+        }
+        assert!(scopes.contains("<tt:ScopeDef>Fixed</tt:ScopeDef>"));
+    }
+
+    #[test]
+    fn hardware_id_is_the_uuid_urn() {
+        let mut config = two_stream_config();
+        config.uuid = "4919811a-5e84-4f3e-b5dd-00000000fc01".to_string();
+        assert!(get_device_information(&config).contains(
+            "<tds:HardwareId>urn:uuid:4919811a-5e84-4f3e-b5dd-00000000fc01</tds:HardwareId>"
+        ));
+    }
+
     fn device(op: &str, config: &Config) -> String {
         let request = format!("<tds:{op}/>");
         let operation = detect_operation(&request);
@@ -985,7 +1041,10 @@ mod tests {
     fn unimplemented_device_operations_are_action_not_supported() {
         let config = two_stream_config();
         for op in ["GetDigitalInputs", "GetIPAddressFilter", "GetSystemUris"] {
-            assert!(device(op, &config).contains("ter:ActionNotSupported"), "{op}");
+            assert!(
+                device(op, &config).contains("ter:ActionNotSupported"),
+                "{op}"
+            );
         }
     }
 

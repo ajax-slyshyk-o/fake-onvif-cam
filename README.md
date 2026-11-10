@@ -313,3 +313,7 @@ Cameras are video-only by default. `audio = "pcmu" | "pcma" | "g722"` (CLI `--au
 - **Ports:** each stream listens for its audio on its video RTP port + 2000 (and the next port for RTCP), for example 7004 for the main stream of a camera with `rtp_port = 5004`. These take part in the fleet port check.
 - **ONVIF:** profiles get an `AudioSourceConfiguration` and `AudioEncoderConfiguration` (shared by all profiles), `GetAudioSources`, `GetAudioSourceConfigurations` and `GetAudioEncoderConfigurations` answer, the scopes include `type/audio_encoder` and DeviceIO reports one audio source. Media1 can only say `G711`, so G.722 is reported as G711 there (Media2 says `G722`).
 - AAC is not supported: it needs a different RTP packetization.
+
+## Stopping
+
+Ctrl+C, and on Unix `SIGTERM` / `SIGHUP`, or the console close, logoff and shutdown events on Windows, stop the app cleanly: the ffmpeg processes are stopped with it. Killing the app by force (`kill -9`, `taskkill /F`) cannot be caught and leaves its ffmpeg processes running; stop those by hand.

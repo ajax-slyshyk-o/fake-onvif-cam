@@ -9,7 +9,7 @@ license = "MIT OR Apache-2.0"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1.0"
-ctrlc = "3.5"
+ctrlc = { version = "3.5", features = ["termination"] }
 md-5 = "0.11"
 sha1 = "0.11"
 base64 = "0.23"

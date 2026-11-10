@@ -181,7 +181,7 @@ fn main() -> process::ExitCode {
 
     match event_rx.recv() {
         Ok(RuntimeEvent::ShutdownRequested) => {
-            println!("Ctrl+C received, shutting down");
+            println!("shutdown requested (Ctrl+C or termination signal), shutting down");
             process::ExitCode::SUCCESS
         }
         Ok(RuntimeEvent::Fatal(message)) => {

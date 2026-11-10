@@ -148,7 +148,27 @@ pub fn discovery_probe_match(config: &Config, relates_to: &str) -> String {
     )
 }
 
+/// ONVIF service that received a SOAP request. Both share one handler, but a few
+/// operations (e.g. `GetServiceCapabilities`) exist in each service with a different answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Service {
+    Device,
+    Media,
+}
+
+/// Response of the Media service (`/onvif/media_service`).
+#[cfg(test)]
 pub fn soap_response(operation: Option<&str>, config: &Config, request: &str) -> String {
+    soap_response_for_service(Service::Media, operation, config, request)
+}
+
+/// Response of the Device (`/onvif/device_service`) or Media service.
+pub fn soap_response_for_service(
+    service: Service,
+    operation: Option<&str>,
+    config: &Config,
+    request: &str,
+) -> String {
     let body = match operation {
         Some("GetCapabilities") => get_capabilities(config),
         Some("GetDeviceInformation") => get_device_information(config),
@@ -171,7 +191,10 @@ pub fn soap_response(operation: Option<&str>, config: &Config, request: &str) ->
         Some("GetVideoEncoderConfigurationOptions") => requested_stream(config, request)
             .map(|(_, stream)| get_video_encoder_configuration_options(&stream))
             .unwrap_or_else(|reason| soap_fault(&reason)),
-        Some("GetServiceCapabilities") => get_service_capabilities(),
+        Some("GetServiceCapabilities") => match service {
+            Service::Device => get_device_service_capabilities(),
+            Service::Media => get_media_service_capabilities(),
+        },
         Some("SetSynchronizationPoint") => "<trt:SetSynchronizationPointResponse/>".to_string(),
         Some(other) => soap_fault(&format!("Unsupported ONVIF operation: {other}")),
         None => soap_fault("Could not detect ONVIF operation"),
@@ -591,9 +614,25 @@ fn get_video_encoder_configuration_options(stream: &Stream) -> String {
     )
 }
 
-fn get_service_capabilities() -> String {
+/// Device service capabilities (tds). No authentication or TLS is implemented.
+fn get_device_service_capabilities() -> String {
+    r#"<tds:GetServiceCapabilitiesResponse>
+  <tds:Capabilities>
+    <tds:Network IPFilter="false" ZeroConfiguration="false" IPVersion6="false" DynDNS="false"/>
+    <tds:Security TLS1.0="false" TLS1.1="false" TLS1.2="false" UsernameToken="false" HttpDigest="false"/>
+    <tds:System DiscoveryResolve="false" DiscoveryBye="false" RemoteDiscovery="false" SystemLogging="false" FirmwareUpgrade="false"/>
+  </tds:Capabilities>
+</tds:GetServiceCapabilitiesResponse>"#
+        .to_string()
+}
+
+/// Media service capabilities (trt).
+fn get_media_service_capabilities() -> String {
     r#"<trt:GetServiceCapabilitiesResponse>
-  <trt:Capabilities SnapshotUri="true" Rotation="false" VideoSourceMode="false" OSD="false"/>
+  <trt:Capabilities SnapshotUri="true" Rotation="false" VideoSourceMode="false" OSD="false">
+    <trt:ProfileCapabilities MaximumNumberOfProfiles="128"/>
+    <trt:StreamingCapabilities RTPMulticast="false" RTP_TCP="true" RTP_RTSP_TCP="true" NonAggregateControl="false"/>
+  </trt:Capabilities>
 </trt:GetServiceCapabilitiesResponse>"#
         .to_string()
 }
@@ -775,6 +814,32 @@ mod tests {
         assert!(main.contains("/live</tr2:Uri>"));
         assert!(sub.contains("/live_sub</tr2:Uri>"));
         assert!(media2("GetStreamUri", &config, &body("x")).contains("<s:Fault>"));
+    }
+
+    #[test]
+    fn device_and_media_service_capabilities_differ() {
+        let config = two_stream_config();
+        let request = "<tds:GetServiceCapabilities/>";
+        let device = soap_response_for_service(
+            Service::Device,
+            Some("GetServiceCapabilities"),
+            &config,
+            request,
+        );
+        assert!(device.contains("<tds:GetServiceCapabilitiesResponse>"));
+        assert!(device.contains("<tds:Security "));
+        assert!(!device.contains("SnapshotUri"));
+
+        let media = soap_response_for_service(
+            Service::Media,
+            Some("GetServiceCapabilities"),
+            &config,
+            request,
+        );
+        assert!(media.contains("<trt:GetServiceCapabilitiesResponse>"));
+        assert!(media.contains(r#"SnapshotUri="true""#));
+        assert!(media.contains("MaximumNumberOfProfiles"));
+        assert!(media.contains("<trt:StreamingCapabilities "));
     }
 
     #[test]

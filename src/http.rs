@@ -59,8 +59,11 @@ fn handle_client(mut stream: TcpStream, config: Arc<Config>) -> io::Result<()> {
     let response = match (request.method.as_str(), path) {
         ("GET", "/") => text_response(200, status_text(200), landing_text(&config)),
         ("GET", "/snapshot.jpg") => binary_response(200, "image/jpeg", SNAPSHOT_JPEG),
-        ("POST", "/onvif/device_service") | ("POST", "/onvif/media_service") => {
-            soap_response_for(&request.body, &config)
+        ("POST", "/onvif/device_service") => {
+            soap_response_for(onvif::Service::Device, &request.body, &config)
+        }
+        ("POST", "/onvif/media_service") => {
+            soap_response_for(onvif::Service::Media, &request.body, &config)
         }
         // Media2 exists only on cameras that publish an H.265 stream.
         ("POST", "/onvif/media2_service") if config.has_hevc() => {
@@ -127,9 +130,9 @@ fn read_request(stream: &TcpStream) -> io::Result<Request> {
     })
 }
 
-fn soap_response_for(body: &str, config: &Config) -> Vec<u8> {
+fn soap_response_for(service: onvif::Service, body: &str, config: &Config) -> Vec<u8> {
     let operation = onvif::detect_operation(body);
-    let xml = onvif::soap_response(operation.as_deref(), config, body);
+    let xml = onvif::soap_response_for_service(service, operation.as_deref(), config, body);
     binary_response(200, "application/soap+xml; charset=utf-8", xml.as_bytes())
 }
 

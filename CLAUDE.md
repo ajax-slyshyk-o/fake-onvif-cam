@@ -110,3 +110,7 @@ Fleet validation rejects duplicate ports or UUIDs across cameras.
 ## Version
 
 Version is embedded at build time from `git describe` via the `git-version` crate (see `build.rs`). Release builds use `-C opt-level=z`, LTO, and stripped debug info.
+
+## Plans
+
+The roadmap for ONVIF parity with logent (measured diff and fix order) is kept outside this repo, in `../fake-onvif-cam-nvr-settings-gen/PLAN.md` (section "Appendix: measured ONVIF parity with logent").

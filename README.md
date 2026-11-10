@@ -303,3 +303,13 @@ Besides Device and Media (and Media2 for H.265), every camera answers four small
 | `/onvif/event_service` | Events | capabilities, `GetEventProperties` (empty topic set), pull-point subscriptions |
 
 The Events service accepts `CreatePullPointSubscription`, `PullMessages`, `Renew` and `Unsubscribe`. There are never any events: `PullMessages` waits for the requested `Timeout` (at most 5 s) and returns an empty batch, so an NVR keeps its subscription alive without being flooded. Any other operation of these services returns `ter:ActionNotSupported`. They share the authentication of the other services.
+
+## Audio
+
+Cameras are video-only by default. `audio = "pcmu" | "pcma" | "g722"` (CLI `--audio`, TOML `[defaults]` with per-camera override) adds an audio track to every stream of the camera:
+
+- **Source:** the audio of the `file` video when it has one (checked with `ffprobe` at startup), otherwise generated silence. Audio is mono and re-encoded at 8 kHz (G.711) or 16 kHz (G.722), 64 kbit/s.
+- **RTSP:** the SDP gets an `m=audio` section (`trackID=1`) with the static payload types 0 (PCMU), 8 (PCMA) or 9 (G.722); a client sets up `trackID=0` for video and `trackID=1` for audio, over UDP or TCP-interleaved (default channels 0-1 and 2-3).
+- **Ports:** each stream listens for its audio on its video RTP port + 2000 (and the next port for RTCP), for example 7004 for the main stream of a camera with `rtp_port = 5004`. These take part in the fleet port check.
+- **ONVIF:** profiles get an `AudioSourceConfiguration` and `AudioEncoderConfiguration` (shared by all profiles), `GetAudioSources`, `GetAudioSourceConfigurations` and `GetAudioEncoderConfigurations` answer, the scopes include `type/audio_encoder` and DeviceIO reports one audio source. Media1 can only say `G711`, so G.722 is reported as G711 there (Media2 says `G722`).
+- AAC is not supported: it needs a different RTP packetization.

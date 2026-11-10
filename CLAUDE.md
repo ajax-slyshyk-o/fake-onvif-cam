@@ -45,8 +45,8 @@ main thread
     ├── HTTP thread     — ONVIF SOAP on TCP (default :8000)
     ├── RTSP accept     — clients connect on TCP (default :8554)
     │   └── per client thread
-    ├── RTP relay       — per stream; receives UDP from ffmpeg (:5004), broadcasts to RTSP clients
-    ├── RTCP relay      — per stream; same for RTCP (:5005)
+    ├── RTP relay       — per stream (and per audio track, port +2000); receives UDP from ffmpeg (:5004), broadcasts to RTSP clients
+    ├── RTCP relay      — per stream/track; same for RTCP (:5005)
     └── ffmpeg process  — one per camera; encodes main (+ optional sub) → RTP, supervised with auto-restart
 ```
 
@@ -92,6 +92,7 @@ http = "0.0.0.0:8000"
 rtsp_port = 8554
 rtp_port = 5004   # RTCP uses rtp_port+1 automatically
 sub_stream = true # optional 2nd stream: /live_sub, 240p, 512k, RTP port rtp_port+1000 (see README)
+audio = "pcmu"    # optional audio track: pcmu, pcma or g722 (from `file` if it has audio, else silence)
 sub_file = "sub.mkv" # optional prepared low-res video for the sub stream (created from `file` if missing)
 
 [[cameras]]

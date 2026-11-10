@@ -53,6 +53,10 @@ pub struct Config {
     pub no_auth: bool,
     /// ONVIF reports snapshots as unsupported and `/snapshot.jpg` is not served.
     pub no_snapshot: bool,
+    /// Audio track of every stream. `None`: video only.
+    pub audio: Option<AudioCodec>,
+    /// The main video file has an audio track to use (set at startup); otherwise silence.
+    pub audio_from_file: bool,
     pub overlay_text: Option<String>,
     pub overlay_font: Option<PathBuf>,
     pub overlay_font_size: u32,
@@ -99,6 +103,90 @@ impl VideoFormat {
     }
 }
 
+/// Audio codec of a camera's audio track. Only static RTP payload types (RFC 3551), so the SDP
+/// needs no `fmtp`. AAC is left out on purpose: it needs another RTP packetization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioCodec {
+    Pcmu,
+    Pcma,
+    G722,
+}
+
+impl AudioCodec {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "pcmu" | "g711u" | "ulaw" => Ok(Self::Pcmu),
+            "pcma" | "g711a" | "alaw" => Ok(Self::Pcma),
+            "g722" => Ok(Self::G722),
+            other => Err(format!(
+                "unknown audio codec \"{other}\" (use pcmu, pcma or g722)"
+            )),
+        }
+    }
+
+    /// ffmpeg encoder name.
+    pub fn encoder(self) -> &'static str {
+        match self {
+            Self::Pcmu => "pcm_mulaw",
+            Self::Pcma => "pcm_alaw",
+            Self::G722 => "g722",
+        }
+    }
+
+    /// Sampling rate of the audio itself.
+    pub fn sample_rate(self) -> u32 {
+        match self {
+            Self::G722 => 16_000,
+            _ => 8_000,
+        }
+    }
+
+    /// Static RTP payload type.
+    pub fn payload_type(self) -> u8 {
+        match self {
+            Self::Pcmu => 0,
+            Self::Pcma => 8,
+            Self::G722 => 9,
+        }
+    }
+
+    /// `a=rtpmap` value. G.722 is sampled at 16 kHz but its RTP clock is 8 kHz (RFC 3551).
+    pub fn rtpmap(self) -> &'static str {
+        match self {
+            Self::Pcmu => "PCMU/8000",
+            Self::Pcma => "PCMA/8000",
+            Self::G722 => "G722/8000",
+        }
+    }
+
+    /// Encoding name in Media1 (`ver10`) audio encoder configurations. That schema only knows
+    /// G711, G726 and AAC, so G.722 is reported as G711 there (Media2 names it correctly).
+    pub fn onvif_encoding(self) -> &'static str {
+        "G711"
+    }
+
+    /// Encoding name in Media2 (`ver20`), which can name G.722 and tells G.711 u-law and A-law apart.
+    pub fn media2_encoding(self) -> &'static str {
+        match self {
+            Self::Pcmu => "PCMU",
+            Self::Pcma => "PCMA",
+            Self::G722 => "G722",
+        }
+    }
+
+    /// Output bitrate in kbit/s (all three codecs are 64 kbit/s).
+    pub fn bitrate_kbps(self) -> u32 {
+        64
+    }
+}
+
+/// The audio track of one stream: it has its own RTP/RTCP port pair.
+#[derive(Clone, Copy, Debug)]
+pub struct AudioStream {
+    pub codec: AudioCodec,
+    pub rtp_port: u16,
+}
+
 /// A fully resolved stream published by a camera.
 #[derive(Clone, Debug)]
 pub struct Stream {
@@ -111,6 +199,7 @@ pub struct Stream {
     pub rtp_port: u16,
     pub codec: String,
     pub preset: Option<String>,
+    pub audio: Option<AudioStream>,
 }
 
 impl Stream {
@@ -120,6 +209,15 @@ impl Stream {
 }
 
 impl Config {
+    fn audio_for(&self, video_rtp_port: u16) -> Option<AudioStream> {
+        self.audio.map(|codec| AudioStream {
+            codec,
+            rtp_port: video_rtp_port
+                .checked_add(AUDIO_RTP_PORT_OFFSET)
+                .unwrap_or_else(|| video_rtp_port.saturating_sub(AUDIO_RTP_PORT_OFFSET)),
+        })
+    }
+
     /// Login required by ONVIF and RTSP: `Some` only when both credentials are set and
     /// authentication was not switched off.
     pub fn auth_credentials(&self) -> Option<(&str, &str)> {
@@ -174,6 +272,8 @@ const SUB_DEFAULT_HEIGHT: u32 = 240;
 const SUB_DEFAULT_BITRATE_KBPS: u32 = 512;
 const SUB_DEFAULT_RTSP_PATH: &str = "live_sub";
 const SUB_RTP_PORT_OFFSET: u16 = 1000;
+/// The audio track of a stream listens `AUDIO_RTP_PORT_OFFSET` above the stream's video port.
+const AUDIO_RTP_PORT_OFFSET: u16 = 2000;
 
 impl Config {
     /// All streams of this camera; the main stream is always first.
@@ -188,6 +288,7 @@ impl Config {
             rtp_port: self.rtp_port,
             codec: self.codec.clone(),
             preset: self.preset.clone(),
+            audio: self.audio_for(self.rtp_port),
         }];
 
         if let Some(sub) = &self.sub {
@@ -206,7 +307,10 @@ impl Config {
                 }),
                 codec: sub.codec.clone(),
                 preset: sub.preset.clone(),
+                audio: None,
             });
+            let sub_stream = streams.last_mut().expect("just pushed");
+            sub_stream.audio = self.audio_for(sub_stream.rtp_port);
         }
 
         streams
@@ -388,6 +492,11 @@ struct Cli {
     #[arg(long = "no-snapshot")]
     no_snapshot: bool,
 
+    /// Add an audio track to every stream: pcmu, pcma or g722. It comes from the --file video
+    /// when that has audio, otherwise it is silence. Off by default.
+    #[arg(long = "audio", value_parser = AudioCodec::parse)]
+    audio: Option<AudioCodec>,
+
     /// Text burned into the video. Defaults to the camera name.
     #[arg(long = "overlay-text")]
     overlay_text: Option<String>,
@@ -501,6 +610,7 @@ struct TomlCamera {
     password: Option<String>,
     auth: Option<bool>,
     snapshot: Option<bool>,
+    audio: Option<String>,
     overlay_text: Option<String>,
     overlay_font: Option<PathBuf>,
     overlay_font_size: Option<u32>,
@@ -626,6 +736,8 @@ impl TryFrom<Cli> for Config {
             password: cli.password,
             no_auth: cli.no_auth,
             no_snapshot: cli.no_snapshot,
+            audio: cli.audio,
+            audio_from_file: false,
             overlay_text,
             overlay_font: if cli.no_overlay {
                 None
@@ -764,6 +876,11 @@ fn camera_from_toml(
         password,
         no_auth: !choose_copy(&camera.auth, &defaults.auth, true),
         no_snapshot: !choose_copy(&camera.snapshot, &defaults.snapshot, true),
+        audio: choose_optional_string(&camera.audio, &defaults.audio)
+            .map(|value| AudioCodec::parse(&value))
+            .transpose()
+            .map_err(|err| format!("camera {}: {err}", index + 1))?,
+        audio_from_file: false,
         overlay_text,
         overlay_font,
         overlay_font_size: validate_non_zero(
@@ -824,6 +941,8 @@ impl Default for Config {
             password: None,
             no_auth: false,
             no_snapshot: false,
+            audio: None,
+            audio_from_file: false,
             overlay_text: Some("Fake ONVIF Camera".to_string()),
             overlay_font: default_overlay_font(),
             overlay_font_size: 32,
@@ -1025,6 +1144,17 @@ fn validate_fleet(configs: &[Config]) -> Result<(), String> {
                     stream.name, config.camera_name
                 ));
             }
+
+            if let Some(audio) = &stream.audio {
+                for port in [audio.rtp_port, audio.rtp_port + 1] {
+                    if !udp_ports.insert(port) {
+                        return Err(format!(
+                            "duplicate UDP audio port {port} ({} stream of {}); audio uses the video port + {AUDIO_RTP_PORT_OFFSET}",
+                            stream.name, config.camera_name
+                        ));
+                    }
+                }
+            }
         }
     }
 
@@ -1166,5 +1296,74 @@ mod tests {
 
         let no_main = toml("[[cameras]]\nsub_stream = true\nsub_file = \"sub.mkv\"\n");
         assert!(no_main.unwrap_err().contains("requires file"));
+    }
+
+    #[test]
+    fn audio_codec_names_and_properties() {
+        assert_eq!(AudioCodec::parse("PCMU"), Ok(AudioCodec::Pcmu));
+        assert_eq!(AudioCodec::parse("g711a"), Ok(AudioCodec::Pcma));
+        assert_eq!(AudioCodec::parse("g722"), Ok(AudioCodec::G722));
+        assert!(AudioCodec::parse("aac")
+            .unwrap_err()
+            .contains("pcmu, pcma or g722"));
+
+        assert_eq!(AudioCodec::G722.sample_rate(), 16_000);
+        assert_eq!(
+            AudioCodec::G722.rtpmap(),
+            "G722/8000",
+            "RTP clock stays 8 kHz"
+        );
+        assert_eq!(
+            [AudioCodec::Pcmu, AudioCodec::Pcma, AudioCodec::G722].map(AudioCodec::payload_type),
+            [0, 8, 9]
+        );
+    }
+
+    #[test]
+    fn audio_gets_its_own_port_pair_per_stream() {
+        let config = Config {
+            audio: Some(AudioCodec::Pcmu),
+            rtp_port: 5004,
+            sub: Some(sub(None, None)),
+            ..Config::default()
+        };
+        let streams = config.streams();
+        assert_eq!(streams[0].audio.unwrap().rtp_port, 7004);
+        assert_eq!(
+            streams[1].audio.unwrap().rtp_port,
+            8004,
+            "sub video is 6004"
+        );
+        assert!(Config::default().streams()[0].audio.is_none());
+    }
+
+    #[test]
+    fn audio_ports_take_part_in_the_fleet_check() {
+        let audio = |http: u16, rtsp: u16, rtp: u16| Config {
+            audio: Some(AudioCodec::Pcma),
+            http_addr: format!("0.0.0.0:{http}").parse().unwrap(),
+            rtsp_port: rtsp,
+            rtp_port: rtp,
+            uuid: format!("{http}"),
+            ..Config::default()
+        };
+        // The audio port of the first camera (5004 + 2000) is the video port of the second.
+        let err = validate_fleet(&[audio(8000, 8554, 5004), audio(8001, 8555, 7004)]).unwrap_err();
+        assert!(err.contains("7004"), "{err}");
+        validate_fleet(&[audio(8000, 8554, 5004), audio(8001, 8555, 5006)]).unwrap();
+    }
+
+    #[test]
+    fn audio_in_toml() {
+        let parse = |body: &str| {
+            let config: TomlConfig = toml::from_str(body).unwrap();
+            camera_from_toml(&config.defaults, &config.cameras[0], 0, Path::new("/cfg"))
+        };
+        let config = parse("[defaults]\naudio = \"g722\"\n[[cameras]]\n").unwrap();
+        assert_eq!(config.audio, Some(AudioCodec::G722));
+        assert_eq!(parse("[[cameras]]\n").unwrap().audio, None);
+        assert!(parse("[[cameras]]\naudio = \"aac\"\n")
+            .unwrap_err()
+            .contains("camera 1"));
     }
 }

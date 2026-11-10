@@ -8,6 +8,9 @@ use crate::util;
 
 const VIDEO_SOURCE_TOKEN: &str = "video_source_1";
 const VIDEO_SOURCE_CONFIG_TOKEN: &str = "video_source_config_1";
+const AUDIO_SOURCE_TOKEN: &str = "audio_source_1";
+const AUDIO_SOURCE_CONFIG_TOKEN: &str = "audio_source_config_1";
+const AUDIO_ENCODER_CONFIG_TOKEN: &str = "audio_encoder_config_1";
 
 fn profile_token(index: usize) -> String {
     format!("profile_{}", index + 1)
@@ -299,13 +302,15 @@ pub fn soap_response_for_service(
         Some("GetSnapshotUri") => get_snapshot_uri(config),
         // The camera has no audio and no metadata streams: empty lists, like logent's metadata.
         Some("GetMetadataConfigurations") => "<trt:GetMetadataConfigurationsResponse/>".to_string(),
-        Some("GetAudioSources") => "<trt:GetAudioSourcesResponse/>".to_string(),
-        Some("GetAudioEncoderConfigurations") => {
-            "<trt:GetAudioEncoderConfigurationsResponse/>".to_string()
-        }
-        Some("GetAudioSourceConfigurations") => {
-            "<trt:GetAudioSourceConfigurationsResponse/>".to_string()
-        }
+        Some("GetAudioSources") => get_audio_sources(config),
+        Some("GetAudioEncoderConfigurations") => list_response(
+            "trt:GetAudioEncoderConfigurationsResponse",
+            &audio_encoder_configuration_xml(config, "trt:Configurations"),
+        ),
+        Some("GetAudioSourceConfigurations") => list_response(
+            "trt:GetAudioSourceConfigurationsResponse",
+            &audio_source_configuration_xml(config, "trt:Configurations"),
+        ),
         Some("GetCompatibleVideoEncoderConfigurations") => requested_stream(config, request)
             .map(|_| get_compatible_video_encoder_configurations(config))
             .unwrap_or_else(|reason| soap_fault(&reason)),
@@ -362,6 +367,7 @@ fn get_capabilities(config: &Config) -> String {
     let events = util::xml_escape(&Service::Events.xaddr(config));
     let imaging = util::xml_escape(&Service::Imaging.xaddr(config));
     let device_io = util::xml_escape(&Service::DeviceIo.xaddr(config));
+    let audio_sources = u8::from(config.audio.is_some());
 
     format!(
         r#"<tds:GetCapabilitiesResponse>
@@ -410,7 +416,7 @@ fn get_capabilities(config: &Config) -> String {
         <tt:XAddr>{device_io}</tt:XAddr>
         <tt:VideoSources>1</tt:VideoSources>
         <tt:VideoOutputs>0</tt:VideoOutputs>
-        <tt:AudioSources>0</tt:AudioSources>
+        <tt:AudioSources>{audio_sources}</tt:AudioSources>
         <tt:AudioOutputs>0</tt:AudioOutputs>
         <tt:RelayOutputs>0</tt:RelayOutputs>
       </tt:DeviceIO>
@@ -517,10 +523,15 @@ fn get_system_date_and_time() -> String {
 /// `Profile/S` and `Profile/Streaming` are what NVRs usually filter discovery results on.
 fn scope_list(config: &Config) -> Vec<(&'static str, String)> {
     const BASE: &str = "onvif://www.onvif.org";
-    vec![
+    let mut scopes = vec![
         ("Fixed", format!("{BASE}/Profile/Streaming")),
         ("Fixed", format!("{BASE}/Profile/S")),
         ("Fixed", format!("{BASE}/type/video_encoder")),
+    ];
+    if config.audio.is_some() {
+        scopes.push(("Fixed", format!("{BASE}/type/audio_encoder")));
+    }
+    scopes.extend([
         (
             "Fixed",
             format!("{BASE}/hardware/{}", util::percent_encode(&config.model)),
@@ -530,7 +541,8 @@ fn scope_list(config: &Config) -> Vec<(&'static str, String)> {
             format!("{BASE}/name/{}", config.camera_name.replace(' ', "_")),
         ),
         ("Configurable", format!("{BASE}/location/TestLab")),
-    ]
+    ]);
+    scopes
 }
 
 fn get_scopes(config: &Config) -> String {
@@ -674,11 +686,14 @@ fn profile_xml(config: &Config, index: usize, stream: &Stream) -> String {
     let name = util::xml_escape(&profile_name(config, index, stream));
     let token = profile_token(index);
 
+    let audio_source = audio_source_configuration_xml(config, "tt:AudioSourceConfiguration");
+    let audio_encoder = audio_encoder_configuration_xml(config, "tt:AudioEncoderConfiguration");
+
     format!(
         r#"<trt:Profiles token="{token}" fixed="true">
     <tt:Name>{name}</tt:Name>
-    {}
-    {}
+    {}{audio_source}
+    {}{audio_encoder}
   </trt:Profiles>"#,
         video_source_configuration_xml(config),
         video_encoder_configuration_xml(index, stream)
@@ -746,6 +761,76 @@ fn get_compatible_video_encoder_configurations(config: &Config) -> String {
     format!(
         "<trt:GetCompatibleVideoEncoderConfigurationsResponse>\n  {}\n</trt:GetCompatibleVideoEncoderConfigurationsResponse>",
         configurations.join("\n  ")
+    )
+}
+
+/// A list response: an empty element when there is nothing to list.
+fn list_response(element: &str, items: &str) -> String {
+    if items.is_empty() {
+        format!("<{element}/>")
+    } else {
+        format!("<{element}>\n  {items}\n</{element}>")
+    }
+}
+
+fn get_audio_sources(config: &Config) -> String {
+    if config.audio.is_none() {
+        return "<trt:GetAudioSourcesResponse/>".to_string();
+    }
+
+    format!(
+        r#"<trt:GetAudioSourcesResponse>
+  <trt:AudioSources token="{AUDIO_SOURCE_TOKEN}">
+    <tt:Channels>1</tt:Channels>
+  </trt:AudioSources>
+</trt:GetAudioSourcesResponse>"#
+    )
+}
+
+/// Empty when the camera has no audio. All streams share one audio source configuration.
+fn audio_source_configuration_xml(config: &Config, element: &str) -> String {
+    if config.audio.is_none() {
+        return String::new();
+    }
+
+    format!(
+        r#"<{element} token="{AUDIO_SOURCE_CONFIG_TOKEN}">
+      <tt:Name>AudioSourceConfig</tt:Name>
+      <tt:UseCount>{}</tt:UseCount>
+      <tt:SourceToken>{AUDIO_SOURCE_TOKEN}</tt:SourceToken>
+    </{element}>"#,
+        config.streams().len()
+    )
+}
+
+/// Empty when the camera has no audio. Media1 can only name G711 (see `onvif_encoding`).
+fn audio_encoder_configuration_xml(config: &Config, element: &str) -> String {
+    let Some(codec) = config.audio else {
+        return String::new();
+    };
+
+    format!(
+        r#"<{element} token="{AUDIO_ENCODER_CONFIG_TOKEN}">
+      <tt:Name>AudioEncoder</tt:Name>
+      <tt:UseCount>{}</tt:UseCount>
+      <tt:Encoding>{}</tt:Encoding>
+      <tt:Bitrate>{}</tt:Bitrate>
+      <tt:SampleRate>{}</tt:SampleRate>
+      <tt:Multicast>
+        <tt:Address>
+          <tt:Type>IPv4</tt:Type>
+          <tt:IPv4Address>0.0.0.0</tt:IPv4Address>
+        </tt:Address>
+        <tt:Port>0</tt:Port>
+        <tt:TTL>1</tt:TTL>
+        <tt:AutoStart>false</tt:AutoStart>
+      </tt:Multicast>
+      <tt:SessionTimeout>PT60S</tt:SessionTimeout>
+    </{element}>"#,
+        config.streams().len(),
+        codec.onvif_encoding(),
+        codec.bitrate_kbps(),
+        codec.sample_rate() / 1000
     )
 }
 
@@ -961,7 +1046,7 @@ fn bitrate_limit(stream: &Stream) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::SubStream;
+    use crate::config::{AudioCodec, SubStream};
 
     fn two_stream_config() -> Config {
         Config {
@@ -1279,6 +1364,47 @@ mod tests {
             let xml = media(op, &config, "");
             assert!(xml.contains(&format!("<trt:{response}/>")), "{op}");
         }
+    }
+
+    fn audio_config(codec: AudioCodec) -> Config {
+        Config {
+            audio: Some(codec),
+            ..two_stream_config()
+        }
+    }
+
+    #[test]
+    fn audio_shows_up_in_profiles_sources_and_scopes() {
+        let config = audio_config(AudioCodec::Pcma);
+
+        let profiles = get_profiles(&config);
+        assert_eq!(profiles.matches("<tt:AudioSourceConfiguration").count(), 2);
+        assert_eq!(profiles.matches("<tt:AudioEncoderConfiguration").count(), 2);
+        assert!(profiles.contains("<tt:Encoding>G711</tt:Encoding>"));
+        assert!(profiles.contains("<tt:SampleRate>8</tt:SampleRate>"));
+        assert!(!get_profiles(&two_stream_config()).contains("Audio"));
+
+        let sources = media("GetAudioSources", &config, "");
+        assert!(sources.contains(r#"<trt:AudioSources token="audio_source_1">"#));
+        let encoders = media("GetAudioEncoderConfigurations", &config, "");
+        assert!(encoders.contains(r#"<trt:Configurations token="audio_encoder_config_1">"#));
+        let source_configs = media("GetAudioSourceConfigurations", &config, "");
+        assert!(source_configs.contains("<tt:SourceToken>audio_source_1</tt:SourceToken>"));
+
+        assert!(get_scopes(&config).contains("type/audio_encoder"));
+        assert!(!get_scopes(&two_stream_config()).contains("audio_encoder"));
+        assert!(get_capabilities(&config).contains("<tt:AudioSources>1</tt:AudioSources>"));
+    }
+
+    #[test]
+    fn g722_is_g711_in_media1_but_g722_in_media2() {
+        let config = audio_config(AudioCodec::G722);
+        let media1 = get_profiles(&config);
+        assert!(media1.contains("<tt:Encoding>G711</tt:Encoding>"));
+        assert!(media1.contains("<tt:SampleRate>16</tt:SampleRate>"));
+
+        let media2 = soap_response_media2(Some("GetProfiles"), &config, "<tr2:GetProfiles/>");
+        assert!(media2.contains("<tt:Encoding>G722</tt:Encoding>"));
     }
 
     #[test]

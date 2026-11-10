@@ -63,6 +63,11 @@ fn main() -> process::ExitCode {
             if !cfg.no_ffmpeg {
                 ffmpeg::prepare_sub_file(&mut cfg);
             }
+            if let (Some(_), config::MediaInput::File(path), false) =
+                (cfg.audio, &cfg.media_input, cfg.no_ffmpeg)
+            {
+                cfg.audio_from_file = ffmpeg::has_audio(&cfg.ffmpeg_path, path);
+            }
             Arc::new(cfg)
         })
         .collect();

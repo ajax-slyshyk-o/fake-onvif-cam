@@ -4,6 +4,7 @@
 use super::{
     action_not_supported_fault, bitrate_limit, profile_name, profile_token, request_value,
     requested_stream, rtsp_uri, snapshot_uri, soap_fault, video_encoder_config_token,
+    AUDIO_ENCODER_CONFIG_TOKEN, AUDIO_SOURCE_CONFIG_TOKEN, AUDIO_SOURCE_TOKEN,
     VIDEO_SOURCE_CONFIG_TOKEN, VIDEO_SOURCE_TOKEN,
 };
 use crate::config::{Config, Stream, VideoFormat};
@@ -102,16 +103,67 @@ fn profile_xml(config: &Config, index: usize, stream: &Stream) -> String {
     let name = util::xml_escape(&profile_name(config, index, stream));
     let token = profile_token(index);
 
+    let audio_source = audio_source_xml(config, "tr2:AudioSource");
+    let audio_encoder = audio_encoder_xml(config, "tr2:AudioEncoder");
+
     format!(
         r#"<tr2:Profiles token="{token}" fixed="true">
     <tr2:Name>{name}</tr2:Name>
     <tr2:Configurations>
-      {}
-      {}
+      {}{audio_source}
+      {}{audio_encoder}
     </tr2:Configurations>
   </tr2:Profiles>"#,
         video_source_xml(config, "tr2:VideoSource"),
         video_encoder_xml(index, stream, "tr2:VideoEncoder")
+    )
+}
+
+/// Empty when the camera has no audio.
+fn audio_source_xml(config: &Config, element: &str) -> String {
+    if config.audio.is_none() {
+        return String::new();
+    }
+
+    format!(
+        r#"
+      <{element} token="{AUDIO_SOURCE_CONFIG_TOKEN}">
+        <tt:Name>AudioSourceConfig</tt:Name>
+        <tt:UseCount>{}</tt:UseCount>
+        <tt:SourceToken>{AUDIO_SOURCE_TOKEN}</tt:SourceToken>
+      </{element}>"#,
+        config.streams().len()
+    )
+}
+
+/// `tt:AudioEncoder2Configuration`, with the real encoding (G.722 included). Empty without audio.
+fn audio_encoder_xml(config: &Config, element: &str) -> String {
+    let Some(codec) = config.audio else {
+        return String::new();
+    };
+
+    format!(
+        r#"
+      <{element} token="{AUDIO_ENCODER_CONFIG_TOKEN}">
+        <tt:Name>AudioEncoder</tt:Name>
+        <tt:UseCount>{}</tt:UseCount>
+        <tt:Encoding>{}</tt:Encoding>
+        <tt:Multicast>
+          <tt:Address>
+            <tt:Type>IPv4</tt:Type>
+            <tt:IPv4Address>0.0.0.0</tt:IPv4Address>
+          </tt:Address>
+          <tt:Port>0</tt:Port>
+          <tt:TTL>1</tt:TTL>
+          <tt:AutoStart>false</tt:AutoStart>
+        </tt:Multicast>
+        <tt:Bitrate>{}</tt:Bitrate>
+        <tt:SampleRate>{}</tt:SampleRate>
+      </{element}>"#,
+        config.streams().len(),
+        codec.media2_encoding(),
+        codec.bitrate_kbps(),
+        codec.sample_rate() / 1000
     )
 }
 
@@ -249,10 +301,16 @@ fn options_xml(format: VideoFormat, stream: &Stream) -> String {
 }
 
 fn service_capabilities(config: &Config) -> String {
+    let configurations = if config.audio.is_some() {
+        "VideoSource VideoEncoder AudioSource AudioEncoder"
+    } else {
+        "VideoSource VideoEncoder"
+    };
+
     format!(
         r#"<tr2:GetServiceCapabilitiesResponse>
   <tr2:Capabilities SnapshotUri="{}" Rotation="false" VideoSourceMode="false" OSD="false">
-    <tr2:ProfileCapabilities MaximumNumberOfProfiles="2" ConfigurationsSupported="VideoSource VideoEncoder"/>
+    <tr2:ProfileCapabilities MaximumNumberOfProfiles="2" ConfigurationsSupported="{configurations}"/>
     <tr2:StreamingCapabilities RTSPStreaming="true" RTPMulticast="false" RTP_RTSP_TCP="true" NonAggregateControl="false"/>
   </tr2:Capabilities>
 </tr2:GetServiceCapabilitiesResponse>"#,

@@ -1,4 +1,4 @@
-use crate::config::{Config, MediaInput, Stream};
+use crate::config::{AudioStream, Config, MediaInput, Stream};
 use std::io;
 use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
@@ -228,6 +228,21 @@ fn spawn_child(config: &Config) -> io::Result<Child> {
             .arg(path);
     }
 
+    // Audio comes from the main video when it has some, otherwise it is generated silence from
+    // one more (real-time) input.
+    let mut audio_input = 0;
+    if let Some(audio) = config.audio {
+        if !(config.audio_from_file && matches!(config.media_input, MediaInput::File(_))) {
+            audio_input = 1 + usize::from(sub_file.is_some() && streams.len() == 2);
+            command
+                .arg("-re")
+                .arg("-f")
+                .arg("lavfi")
+                .arg("-i")
+                .arg(format!("anullsrc=r={}:cl=mono", audio.sample_rate()));
+        }
+    }
+
     let mut vfilters: Vec<String> = Vec::new();
 
     if config.scale && matches!(config.media_input, MediaInput::File(_)) {
@@ -247,6 +262,7 @@ fn spawn_child(config: &Config) -> io::Result<Child> {
     // sub stream is scaled down from the copy.
     match streams.as_slice() {
         [main] => {
+            command.arg("-map").arg("0:v:0");
             if !vfilters.is_empty() {
                 command.arg("-vf").arg(vfilters.join(","));
             }
@@ -271,12 +287,77 @@ fn spawn_child(config: &Config) -> io::Result<Child> {
         _ => return Err(io::Error::other("unsupported number of streams")),
     }
 
+    // One RTP output per audio track, each on its own port pair.
+    for (index, stream) in streams.iter().enumerate() {
+        if let Some(audio) = &stream.audio {
+            add_audio_output(&mut command, audio_input, audio, 11 + index as u32);
+        }
+    }
+
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
 
     command.spawn()
+}
+
+/// Command-line arguments of the RTP output carrying one audio track.
+fn audio_output_args(
+    input_index: usize,
+    audio: &AudioStream,
+    ssrc: u32,
+    local: &str,
+) -> Vec<String> {
+    let rate = audio.codec.sample_rate();
+    vec![
+        "-map".to_string(),
+        format!("{input_index}:a:0"),
+        "-vn".to_string(),
+        "-af".to_string(),
+        format!("aformat=sample_fmts=s16:sample_rates={rate}:channel_layouts=mono"),
+        "-c:a".to_string(),
+        audio.codec.encoder().to_string(),
+        "-ar".to_string(),
+        rate.to_string(),
+        "-ac".to_string(),
+        "1".to_string(),
+        "-f".to_string(),
+        "rtp".to_string(),
+        "-ssrc".to_string(),
+        ssrc.to_string(),
+        format!(
+            "rtp://127.0.0.1:{}?rtcpport={}&pkt_size=1200{local}",
+            audio.rtp_port,
+            audio.rtp_port + 1
+        ),
+    ]
+}
+
+fn add_audio_output(command: &mut Command, input_index: usize, audio: &AudioStream, ssrc: u32) {
+    let local = free_local_port_pair()
+        .map(|port| format!("&localport={}&localrtcpport={}", port, port + 1))
+        .unwrap_or_default();
+    command.args(audio_output_args(input_index, audio, ssrc, &local));
+}
+
+/// True when `file` has at least one audio stream.
+pub fn has_audio(ffmpeg_path: &Path, file: &Path) -> bool {
+    Command::new(ffprobe_path(ffmpeg_path))
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(file)
+        .output()
+        .map(|output| output.status.success() && !output.stdout.trim_ascii().is_empty())
+        .unwrap_or(false)
 }
 
 fn split_filter_graph(vfilters: &[String], sub: &Stream) -> String {
@@ -625,7 +706,31 @@ mod tests {
             rtp_port: 6004,
             codec: "libx264".to_string(),
             preset: None,
+            audio: None,
         }
+    }
+
+    #[test]
+    fn audio_output_encodes_g711_and_g722_at_their_rates() {
+        use crate::config::AudioCodec;
+        let args = |codec| {
+            audio_output_args(
+                2,
+                &AudioStream {
+                    codec,
+                    rtp_port: 8004,
+                },
+                11,
+                "",
+            )
+            .join(" ")
+        };
+        assert_eq!(
+            args(AudioCodec::Pcmu),
+            "-map 2:a:0 -vn -af aformat=sample_fmts=s16:sample_rates=8000:channel_layouts=mono -c:a pcm_mulaw -ar 8000 -ac 1 -f rtp -ssrc 11 rtp://127.0.0.1:8004?rtcpport=8005&pkt_size=1200"
+        );
+        assert!(args(AudioCodec::Pcma).contains("-c:a pcm_alaw -ar 8000"));
+        assert!(args(AudioCodec::G722).contains("-c:a g722 -ar 16000"));
     }
 
     fn encoder_args(codec: &str, preset: Option<&str>) -> Vec<String> {

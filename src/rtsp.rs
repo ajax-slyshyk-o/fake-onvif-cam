@@ -57,13 +57,21 @@ struct TcpPacket {
     data: Vec<u8>,
 }
 
+/// One RTP/RTCP track of a stream (video or audio): its ingest sockets, fed by ffmpeg, and the
+/// RTSP clients subscribed to it.
+struct TrackRelay {
+    clients: Clients,
+    rtp_socket: Arc<UdpSocket>,
+    rtcp_socket: Arc<UdpSocket>,
+    rtp_port: u16,
+}
+
 /// Per-stream relay state: the stream description, its RTP/RTCP ingest sockets (fed by
 /// ffmpeg) and the RTSP clients currently subscribed to it.
 struct StreamRelay {
     stream: Stream,
-    clients: Clients,
-    rtp_socket: Arc<UdpSocket>,
-    rtcp_socket: Arc<UdpSocket>,
+    video: TrackRelay,
+    audio: Option<TrackRelay>,
 }
 
 struct RtspRequest {
@@ -94,31 +102,22 @@ pub fn spawn(config: Arc<Config>) -> io::Result<RtspServerGuard> {
     let mut workers = Vec::new();
 
     for stream in config.streams() {
-        let rtp_socket = Arc::new(UdpSocket::bind(("127.0.0.1", stream.rtp_port))?);
-        let rtcp_socket = Arc::new(UdpSocket::bind(("127.0.0.1", stream.rtp_port + 1))?);
-        rtp_socket.set_read_timeout(Some(Duration::from_millis(500)))?;
-        rtcp_socket.set_read_timeout(Some(Duration::from_millis(500)))?;
-
-        let clients: Clients = Arc::new(Mutex::new(Vec::new()));
-        workers.push(spawn_relay_loop(
-            &format!("rtp-relay-{}", stream.name),
-            rtp_socket.clone(),
-            clients.clone(),
-            stop.clone(),
-            false,
-        )?);
-        workers.push(spawn_relay_loop(
-            &format!("rtcp-relay-{}", stream.name),
-            rtcp_socket.clone(),
-            clients.clone(),
-            stop.clone(),
-            true,
-        )?);
+        let video = spawn_track(stream.name, stream.rtp_port, &stop, &mut workers)?;
+        let audio = stream
+            .audio
+            .map(|audio| {
+                spawn_track(
+                    &format!("{}-audio", stream.name),
+                    audio.rtp_port,
+                    &stop,
+                    &mut workers,
+                )
+            })
+            .transpose()?;
         relays.push(Arc::new(StreamRelay {
             stream,
-            clients,
-            rtp_socket,
-            rtcp_socket,
+            video,
+            audio,
         }));
     }
 
@@ -130,6 +129,42 @@ pub fn spawn(config: Arc<Config>) -> io::Result<RtspServerGuard> {
     )?);
 
     Ok(RtspServerGuard { stop, workers })
+}
+
+/// Binds the ingest sockets of one track and starts its RTP and RTCP relay threads.
+fn spawn_track(
+    name: &str,
+    rtp_port: u16,
+    stop: &Arc<AtomicBool>,
+    workers: &mut Vec<JoinHandle<()>>,
+) -> io::Result<TrackRelay> {
+    let rtp_socket = Arc::new(UdpSocket::bind(("127.0.0.1", rtp_port))?);
+    let rtcp_socket = Arc::new(UdpSocket::bind(("127.0.0.1", rtp_port + 1))?);
+    rtp_socket.set_read_timeout(Some(Duration::from_millis(500)))?;
+    rtcp_socket.set_read_timeout(Some(Duration::from_millis(500)))?;
+
+    let clients: Clients = Arc::new(Mutex::new(Vec::new()));
+    workers.push(spawn_relay_loop(
+        &format!("rtp-relay-{name}"),
+        rtp_socket.clone(),
+        clients.clone(),
+        stop.clone(),
+        false,
+    )?);
+    workers.push(spawn_relay_loop(
+        &format!("rtcp-relay-{name}"),
+        rtcp_socket.clone(),
+        clients.clone(),
+        stop.clone(),
+        true,
+    )?);
+
+    Ok(TrackRelay {
+        clients,
+        rtp_socket,
+        rtcp_socket,
+        rtp_port,
+    })
 }
 
 fn spawn_accept_loop(
@@ -275,8 +310,11 @@ fn handle_client(
     let session = util::make_uuid();
     let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
     let playing = Arc::new(AtomicBool::new(false));
-    // Stream this connection is subscribed to (index into `relays`), set by SETUP.
+    // Stream this connection is subscribed to (index into `relays`), set by SETUP, and which
+    // of its tracks were set up.
     let mut subscribed: Option<usize> = None;
+    let mut video_setup = false;
+    let mut audio_setup = false;
 
     while let Some(request) = read_request(&mut reader)? {
         let cseq = request.cseq();
@@ -336,25 +374,39 @@ fn handle_client(
                     continue;
                 };
                 let relay = &relays[index];
+                // `trackID=1` is the audio track; anything else is the video track.
+                let wants_audio = is_audio_track(&request.uri);
+                let track = if wants_audio {
+                    let Some(audio) = &relay.audio else {
+                        write_response(&writer, 404, "Not Found", &cseq, &[], &[])?;
+                        continue;
+                    };
+                    audio
+                } else {
+                    &relay.video
+                };
                 let transport = request.header("Transport").unwrap_or("");
-                let Some((sink, response_transport)) = setup_transport(
-                    transport,
-                    peer,
-                    writer.clone(),
-                    relay.rtp_socket.clone(),
-                    relay.rtcp_socket.clone(),
-                    &relay.stream,
-                ) else {
+                let default_channels = if wants_audio { (2, 3) } else { (0, 1) };
+                let Some((sink, response_transport)) =
+                    setup_transport(transport, peer, writer.clone(), track, default_channels)
+                else {
                     write_response(&writer, 461, "Unsupported Transport", &cseq, &[], &[])?;
                     continue;
                 };
 
                 if let Some(previous) = subscribed.filter(|previous| *previous != index) {
-                    remove_clients(&relays[previous].clients, &[client_id]);
+                    remove_stream_clients(&relays[previous], client_id);
+                    video_setup = false;
+                    audio_setup = false;
                 }
                 subscribed = Some(index);
+                if wants_audio {
+                    audio_setup = true;
+                } else {
+                    video_setup = true;
+                }
                 replace_client(
-                    &relay.clients,
+                    &track.clients,
                     Client {
                         id: client_id,
                         playing: playing.clone(),
@@ -376,6 +428,14 @@ fn handle_client(
             "PLAY" => {
                 playing.store(true, Ordering::Relaxed);
                 let stream = &relays[subscribed.unwrap_or(0)].stream;
+                let base = onvif::rtsp_uri(&config, stream);
+                let mut rtp_info = Vec::new();
+                if video_setup || !audio_setup {
+                    rtp_info.push(format!("url={base}/trackID=0;seq=0;rtptime=0"));
+                }
+                if audio_setup {
+                    rtp_info.push(format!("url={base}/trackID=1;seq=0;rtptime=0"));
+                }
                 write_response(
                     &writer,
                     200,
@@ -383,13 +443,7 @@ fn handle_client(
                     &cseq,
                     &[
                         ("Session", session.clone()),
-                        (
-                            "RTP-Info",
-                            format!(
-                                "url={}/trackID=0;seq=0;rtptime=0",
-                                onvif::rtsp_uri(&config, stream)
-                            ),
-                        ),
+                        ("RTP-Info", rtp_info.join(",")),
                     ],
                     &[],
                 )?;
@@ -430,9 +484,22 @@ fn handle_client(
     }
 
     if let Some(index) = subscribed {
-        remove_clients(&relays[index].clients, &[client_id]);
+        remove_stream_clients(&relays[index], client_id);
     }
     Ok(())
+}
+
+/// Removes a connection from every track of a stream.
+fn remove_stream_clients(relay: &StreamRelay, client_id: u64) {
+    remove_clients(&relay.video.clients, &[client_id]);
+    if let Some(audio) = &relay.audio {
+        remove_clients(&audio.clients, &[client_id]);
+    }
+}
+
+/// True when the request URI addresses the audio track (`.../trackID=1`).
+fn is_audio_track(uri: &str) -> bool {
+    uri_path(uri).rsplit('/').next() == Some("trackID=1")
 }
 
 /// Picks the stream addressed by an RTSP request URI. A single-stream camera keeps accepting
@@ -460,14 +527,13 @@ fn setup_transport(
     transport: &str,
     peer: SocketAddr,
     writer: Arc<Mutex<TcpStream>>,
-    rtp_socket: Arc<UdpSocket>,
-    rtcp_socket: Arc<UdpSocket>,
-    stream: &Stream,
+    track: &TrackRelay,
+    default_channels: (u8, u8),
 ) -> Option<(ClientSink, String)> {
     if transport.to_ascii_uppercase().contains("RTP/AVP/TCP")
         || transport.to_ascii_lowercase().contains("interleaved")
     {
-        let (rtp_channel, rtcp_channel) = parse_interleaved(transport).unwrap_or((0, 1));
+        let (rtp_channel, rtcp_channel) = parse_interleaved(transport).unwrap_or(default_channels);
         let (packet_tx, packet_rx) = mpsc::sync_channel::<TcpPacket>(4096);
         let packet_writer = writer.clone();
         let _ = thread::Builder::new()
@@ -496,15 +562,15 @@ fn setup_transport(
 
     Some((
         ClientSink::Udp {
-            rtp_socket,
-            rtcp_socket,
+            rtp_socket: track.rtp_socket.clone(),
+            rtcp_socket: track.rtcp_socket.clone(),
             rtp_peer,
             rtcp_peer,
         },
         format!(
             "RTP/AVP;unicast;client_port={client_rtp}-{client_rtcp};server_port={}-{}",
-            stream.rtp_port,
-            stream.rtp_port + 1
+            track.rtp_port,
+            track.rtp_port + 1
         ),
     ))
 }
@@ -669,6 +735,19 @@ fn sdp(config: &Config, stream: &Stream) -> String {
         VideoFormat::H265 => "a=rtpmap:96 H265/90000\r\n",
     };
 
+    let audio_lines = stream
+        .audio
+        .map(|audio| {
+            format!(
+                "m=audio 0 RTP/AVP {pt}\r\n\
+                 a=rtpmap:{pt} {}\r\n\
+                 a=control:trackID=1\r\n",
+                audio.codec.rtpmap(),
+                pt = audio.codec.payload_type()
+            )
+        })
+        .unwrap_or_default();
+
     format!(
         "v=0\r\n\
          o=- 0 0 IN IP4 0.0.0.0\r\n\
@@ -679,7 +758,8 @@ fn sdp(config: &Config, stream: &Stream) -> String {
          m=video 0 RTP/AVP 96\r\n\
          {codec_lines}\
          a=framerate:{}\r\n\
-         a=control:trackID=0\r\n",
+         a=control:trackID=0\r\n\
+         {audio_lines}",
         stream.fps
     )
 }
@@ -700,11 +780,49 @@ mod tests {
                 rtp_port: port,
                 codec: String::new(),
                 preset: None,
+                audio: None,
             },
-            clients: Arc::new(Mutex::new(Vec::new())),
-            rtp_socket: Arc::new(UdpSocket::bind(("127.0.0.1", 0)).unwrap()),
-            rtcp_socket: Arc::new(UdpSocket::bind(("127.0.0.1", 0)).unwrap()),
+            video: TrackRelay {
+                clients: Arc::new(Mutex::new(Vec::new())),
+                rtp_socket: Arc::new(UdpSocket::bind(("127.0.0.1", 0)).unwrap()),
+                rtcp_socket: Arc::new(UdpSocket::bind(("127.0.0.1", 0)).unwrap()),
+                rtp_port: port,
+            },
+            audio: None,
         })
+    }
+
+    #[test]
+    fn sdp_adds_the_audio_track_with_static_payload_types() {
+        use crate::config::{AudioCodec, AudioStream};
+        let sdp_for = |codec| {
+            let stream = Stream {
+                audio: Some(AudioStream {
+                    codec,
+                    rtp_port: 8004,
+                }),
+                ..relay("live", 5004).stream.clone()
+            };
+            sdp(&Config::default(), &stream)
+        };
+
+        let pcmu = sdp_for(AudioCodec::Pcmu);
+        assert!(
+            pcmu.contains("m=audio 0 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=control:trackID=1\r\n")
+        );
+        assert!(sdp_for(AudioCodec::Pcma).contains("m=audio 0 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000"));
+        assert!(sdp_for(AudioCodec::G722).contains("m=audio 0 RTP/AVP 9\r\na=rtpmap:9 G722/8000"));
+
+        let video_only = sdp(&Config::default(), &relay("live", 5004).stream);
+        assert!(!video_only.contains("m=audio"));
+    }
+
+    #[test]
+    fn audio_track_is_addressed_by_track_id_one() {
+        assert!(is_audio_track("rtsp://h:8554/live/trackID=1"));
+        assert!(is_audio_track("rtsp://h:8554/live_sub/trackID=1"));
+        assert!(!is_audio_track("rtsp://h:8554/live/trackID=0"));
+        assert!(!is_audio_track("rtsp://h:8554/live"));
     }
 
     #[test]

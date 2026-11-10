@@ -48,12 +48,12 @@ pub fn soap_body(
 </timg:GetImagingSettingsResponse>"#
                 .to_string()
         }
-        (Service::DeviceIo, "GetServiceCapabilities") => {
+        (Service::DeviceIo, "GetServiceCapabilities") => format!(
             r#"<tmd:GetServiceCapabilitiesResponse>
-  <tmd:Capabilities VideoSources="1" VideoOutputs="0" AudioSources="0" AudioOutputs="0" RelayOutputs="0" DigitalInputs="0" SerialPorts="0"/>
-</tmd:GetServiceCapabilitiesResponse>"#
-                .to_string()
-        }
+  <tmd:Capabilities VideoSources="1" VideoOutputs="0" AudioSources="{}" AudioOutputs="0" RelayOutputs="0" DigitalInputs="0" SerialPorts="0"/>
+</tmd:GetServiceCapabilitiesResponse>"#,
+            u8::from(config.audio.is_some())
+        ),
         (Service::Analytics, "GetServiceCapabilities") => {
             r#"<tan:GetServiceCapabilitiesResponse>
   <tan:Capabilities RuleSupport="false" AnalyticsModuleSupport="false" CellBasedSceneDescriptionSupported="false"/>

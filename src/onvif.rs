@@ -3,21 +3,131 @@ mod services;
 
 pub use services::pull_wait;
 
-use crate::config::{Config, Stream};
+use crate::config::{Config, Naming, Stream};
 use crate::util;
 
-const VIDEO_SOURCE_TOKEN: &str = "video_source_1";
-const VIDEO_SOURCE_CONFIG_TOKEN: &str = "video_source_config_1";
-const AUDIO_SOURCE_TOKEN: &str = "audio_source_1";
-const AUDIO_SOURCE_CONFIG_TOKEN: &str = "audio_source_config_1";
-const AUDIO_ENCODER_CONFIG_TOKEN: &str = "audio_encoder_config_1";
+/// Tokens and display names of the ONVIF objects of one camera, per [`Naming`] scheme. The default
+/// scheme numbers things (`profile_1`); the logent scheme copies a logent camera (`cam-0-main`).
+#[derive(Clone, Copy)]
+struct Names(Naming);
 
-fn profile_token(index: usize) -> String {
-    format!("profile_{}", index + 1)
+fn names(config: &Config) -> Names {
+    Names(config.naming)
 }
 
-fn video_encoder_config_token(index: usize) -> String {
-    format!("video_encoder_config_{}", index + 1)
+impl Names {
+    fn logent(self) -> bool {
+        self.0 == Naming::Logent
+    }
+
+    /// `main` or `sub`, as logent spells the stream in tokens.
+    fn kind(index: usize) -> &'static str {
+        if index == 0 {
+            "main"
+        } else {
+            "sub"
+        }
+    }
+
+    fn profile_token(self, index: usize) -> String {
+        if self.logent() {
+            format!("cam-0-{}", Self::kind(index))
+        } else {
+            format!("profile_{}", index + 1)
+        }
+    }
+
+    fn profile_name(self, config: &Config, index: usize, stream: &Stream) -> String {
+        if self.logent() {
+            format!("Cam_{}", Self::kind(index))
+        } else if index == 0 {
+            config.camera_name.clone()
+        } else {
+            format!("{} {}", config.camera_name, stream.name)
+        }
+    }
+
+    fn video_source_token(self) -> &'static str {
+        if self.logent() {
+            "cam-0"
+        } else {
+            "video_source_1"
+        }
+    }
+
+    fn video_source_config_token(self) -> &'static str {
+        if self.logent() {
+            "cam-0-vcfg"
+        } else {
+            "video_source_config_1"
+        }
+    }
+
+    fn video_source_config_name(self) -> &'static str {
+        if self.logent() {
+            "Cam_vsrc"
+        } else {
+            "VideoSourceConfig"
+        }
+    }
+
+    fn video_encoder_token(self, index: usize) -> String {
+        if self.logent() {
+            format!("cam-0-venc-{}", Self::kind(index))
+        } else {
+            format!("video_encoder_config_{}", index + 1)
+        }
+    }
+
+    /// `family` is the encoder family (`H264` or `H265`) of the default names.
+    fn video_encoder_name(self, index: usize, family: &str) -> String {
+        match (self.logent(), index == 0) {
+            (true, true) => "Cam_vmain".to_string(),
+            (true, false) => "Cam_vsub".to_string(),
+            (false, true) => format!("{family}Encoder"),
+            (false, false) => format!("{family}EncoderSub"),
+        }
+    }
+
+    fn audio_source_token(self) -> &'static str {
+        if self.logent() {
+            "cam-0-a"
+        } else {
+            "audio_source_1"
+        }
+    }
+
+    fn audio_source_config_token(self) -> &'static str {
+        if self.logent() {
+            "cam-0-acfg"
+        } else {
+            "audio_source_config_1"
+        }
+    }
+
+    fn audio_source_config_name(self) -> &'static str {
+        if self.logent() {
+            "Cam_asrc"
+        } else {
+            "AudioSourceConfig"
+        }
+    }
+
+    fn audio_encoder_token(self) -> &'static str {
+        if self.logent() {
+            "cam-0-aenc"
+        } else {
+            "audio_encoder_config_1"
+        }
+    }
+
+    fn audio_encoder_name(self) -> &'static str {
+        if self.logent() {
+            "Cam_a"
+        } else {
+            "AudioEncoder"
+        }
+    }
 }
 
 /// Text of the first `<...:name>value</...>` element in a SOAP request.
@@ -34,9 +144,9 @@ fn request_value<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
 fn requested_stream(config: &Config, request: &str) -> Result<(usize, Stream), String> {
     let streams = config.streams();
     let found = if let Some(token) = request_value(request, "ProfileToken") {
-        (0..streams.len()).find(|index| profile_token(*index) == token)
+        (0..streams.len()).find(|index| names(config).profile_token(*index) == token)
     } else if let Some(token) = request_value(request, "ConfigurationToken") {
-        (0..streams.len()).find(|index| video_encoder_config_token(*index) == token)
+        (0..streams.len()).find(|index| names(config).video_encoder_token(*index) == token)
     } else {
         Some(0)
     };
@@ -675,16 +785,12 @@ fn get_profile(config: &Config, index: usize, stream: &Stream) -> String {
 }
 
 fn profile_name(config: &Config, index: usize, stream: &Stream) -> String {
-    if index == 0 {
-        config.camera_name.clone()
-    } else {
-        format!("{} {}", config.camera_name, stream.name)
-    }
+    names(config).profile_name(config, index, stream)
 }
 
 fn profile_xml(config: &Config, index: usize, stream: &Stream) -> String {
     let name = util::xml_escape(&profile_name(config, index, stream));
-    let token = profile_token(index);
+    let token = names(config).profile_token(index);
 
     let audio_source = audio_source_configuration_xml(config, "tt:AudioSourceConfiguration");
     let audio_encoder = audio_encoder_configuration_xml(config, "tt:AudioEncoderConfiguration");
@@ -696,7 +802,7 @@ fn profile_xml(config: &Config, index: usize, stream: &Stream) -> String {
     {}{audio_encoder}
   </trt:Profiles>"#,
         video_source_configuration_xml(config),
-        video_encoder_configuration_xml(index, stream)
+        video_encoder_configuration_xml(config, index, stream)
     )
 }
 
@@ -733,7 +839,7 @@ fn get_snapshot_uri(config: &Config) -> String {
 fn get_video_sources(config: &Config) -> String {
     format!(
         r#"<trt:GetVideoSourcesResponse>
-  <trt:VideoSources token="{VIDEO_SOURCE_TOKEN}">
+  <trt:VideoSources token="{}">
     <tt:Framerate>{}</tt:Framerate>
     <tt:Resolution>
       <tt:Width>{}</tt:Width>
@@ -741,7 +847,10 @@ fn get_video_sources(config: &Config) -> String {
     </tt:Resolution>
   </trt:VideoSources>
 </trt:GetVideoSourcesResponse>"#,
-        config.fps, config.width, config.height
+        names(config).video_source_token(),
+        config.fps,
+        config.width,
+        config.height
     )
 }
 
@@ -753,7 +862,7 @@ fn get_compatible_video_encoder_configurations(config: &Config) -> String {
         .enumerate()
         .map(|(index, stream)| {
             // In a list response the element is `trt:Configurations`, not `tt:VideoEncoderConfiguration`.
-            video_encoder_configuration_xml(index, stream)
+            video_encoder_configuration_xml(config, index, stream)
                 .replace("tt:VideoEncoderConfiguration", "trt:Configurations")
         })
         .collect();
@@ -780,10 +889,11 @@ fn get_audio_sources(config: &Config) -> String {
 
     format!(
         r#"<trt:GetAudioSourcesResponse>
-  <trt:AudioSources token="{AUDIO_SOURCE_TOKEN}">
+  <trt:AudioSources token="{}">
     <tt:Channels>1</tt:Channels>
   </trt:AudioSources>
-</trt:GetAudioSourcesResponse>"#
+</trt:GetAudioSourcesResponse>"#,
+        names(config).audio_source_token()
     )
 }
 
@@ -793,13 +903,17 @@ fn audio_source_configuration_xml(config: &Config, element: &str) -> String {
         return String::new();
     }
 
+    let names = names(config);
     format!(
-        r#"<{element} token="{AUDIO_SOURCE_CONFIG_TOKEN}">
-      <tt:Name>AudioSourceConfig</tt:Name>
+        r#"<{element} token="{}">
+      <tt:Name>{}</tt:Name>
       <tt:UseCount>{}</tt:UseCount>
-      <tt:SourceToken>{AUDIO_SOURCE_TOKEN}</tt:SourceToken>
+      <tt:SourceToken>{}</tt:SourceToken>
     </{element}>"#,
-        config.streams().len()
+        names.audio_source_config_token(),
+        names.audio_source_config_name(),
+        config.streams().len(),
+        names.audio_source_token()
     )
 }
 
@@ -810,8 +924,8 @@ fn audio_encoder_configuration_xml(config: &Config, element: &str) -> String {
     };
 
     format!(
-        r#"<{element} token="{AUDIO_ENCODER_CONFIG_TOKEN}">
-      <tt:Name>AudioEncoder</tt:Name>
+        r#"<{element} token="{}">
+      <tt:Name>{}</tt:Name>
       <tt:UseCount>{}</tt:UseCount>
       <tt:Encoding>{}</tt:Encoding>
       <tt:Bitrate>{}</tt:Bitrate>
@@ -827,6 +941,8 @@ fn audio_encoder_configuration_xml(config: &Config, element: &str) -> String {
       </tt:Multicast>
       <tt:SessionTimeout>PT60S</tt:SessionTimeout>
     </{element}>"#,
+        names(config).audio_encoder_token(),
+        names(config).audio_encoder_name(),
         config.streams().len(),
         codec.onvif_encoding(),
         codec.bitrate_kbps(),
@@ -845,13 +961,16 @@ fn get_video_source_configurations(config: &Config) -> String {
 
 fn video_source_configuration_xml(config: &Config) -> String {
     format!(
-        r#"<tt:VideoSourceConfiguration token="{VIDEO_SOURCE_CONFIG_TOKEN}">
-      <tt:Name>VideoSourceConfig</tt:Name>
+        r#"<tt:VideoSourceConfiguration token="{}">
+      <tt:Name>{}</tt:Name>
       <tt:UseCount>{}</tt:UseCount>
-      <tt:SourceToken>{VIDEO_SOURCE_TOKEN}</tt:SourceToken>
+      <tt:SourceToken>{}</tt:SourceToken>
       <tt:Bounds x="0" y="0" width="{}" height="{}"/>
     </tt:VideoSourceConfiguration>"#,
+        names(config).video_source_config_token(),
+        names(config).video_source_config_name(),
         config.streams().len(),
+        names(config).video_source_token(),
         config.width,
         config.height
     )
@@ -862,7 +981,7 @@ fn get_video_encoder_configurations(config: &Config) -> String {
         .streams()
         .iter()
         .enumerate()
-        .map(|(index, stream)| video_encoder_configuration_xml(index, stream))
+        .map(|(index, stream)| video_encoder_configuration_xml(config, index, stream))
         .collect();
 
     format!(
@@ -876,13 +995,9 @@ fn get_video_encoder_configurations(config: &Config) -> String {
 /// Media1 profile encoder configuration. Media1 only knows JPEG/MPEG4/H264, so like the real
 /// cameras this emulates, an HEVC stream is reported here as H.264 Baseline; clients that
 /// understand H.265 read the real encoding from Media2.
-fn video_encoder_configuration_xml(index: usize, stream: &Stream) -> String {
-    let token = video_encoder_config_token(index);
-    let name = if index == 0 {
-        "H264Encoder"
-    } else {
-        "H264EncoderSub"
-    };
+fn video_encoder_configuration_xml(config: &Config, index: usize, stream: &Stream) -> String {
+    let token = names(config).video_encoder_token(index);
+    let name = names(config).video_encoder_name(index, "H264");
 
     format!(
         r#"<tt:VideoEncoderConfiguration token="{token}">
@@ -1394,6 +1509,80 @@ mod tests {
         assert!(get_scopes(&config).contains("type/audio_encoder"));
         assert!(!get_scopes(&two_stream_config()).contains("audio_encoder"));
         assert!(get_capabilities(&config).contains("<tt:AudioSources>1</tt:AudioSources>"));
+    }
+
+    fn logent_config() -> Config {
+        Config {
+            naming: Naming::Logent,
+            audio: Some(AudioCodec::Pcmu),
+            rtsp_path: "cam-0_m".to_string(),
+            ..two_stream_config()
+        }
+    }
+
+    #[test]
+    fn logent_naming_renames_tokens_and_names() {
+        let mut config = logent_config();
+        config.sub.as_mut().unwrap().rtsp_path = "cam-0_s".to_string();
+        let profiles = get_profiles(&config);
+
+        for expected in [
+            r#"<trt:Profiles token="cam-0-main""#,
+            r#"<trt:Profiles token="cam-0-sub""#,
+            "<tt:Name>Cam_main</tt:Name>",
+            "<tt:Name>Cam_sub</tt:Name>",
+            r#"<tt:VideoSourceConfiguration token="cam-0-vcfg">"#,
+            "<tt:Name>Cam_vsrc</tt:Name>",
+            "<tt:SourceToken>cam-0</tt:SourceToken>",
+            r#"<tt:VideoEncoderConfiguration token="cam-0-venc-main">"#,
+            r#"<tt:VideoEncoderConfiguration token="cam-0-venc-sub">"#,
+            "<tt:Name>Cam_vmain</tt:Name>",
+            "<tt:Name>Cam_vsub</tt:Name>",
+            r#"<tt:AudioSourceConfiguration token="cam-0-acfg">"#,
+            "<tt:SourceToken>cam-0-a</tt:SourceToken>",
+            r#"<tt:AudioEncoderConfiguration token="cam-0-aenc">"#,
+            "<tt:Name>Cam_asrc</tt:Name>",
+            "<tt:Name>Cam_a</tt:Name>",
+        ] {
+            assert!(profiles.contains(expected), "{expected}");
+        }
+        assert!(!profiles.contains("profile_1") && !profiles.contains("video_source_1"));
+        assert!(get_video_sources(&config).contains(r#"VideoSources token="cam-0""#));
+        assert!(media("GetAudioSources", &config, "").contains(r#"AudioSources token="cam-0-a""#));
+    }
+
+    #[test]
+    fn logent_tokens_are_what_requests_are_matched_against() {
+        let config = logent_config();
+        let uri = |token: &str| {
+            soap_response(
+                Some("GetStreamUri"),
+                &config,
+                &request("GetStreamUri", token),
+            )
+        };
+        assert!(uri("cam-0-main").contains("/cam-0_m</tt:Uri>"));
+        assert!(uri("cam-0-sub").contains("/live_sub</tt:Uri>"));
+        assert!(
+            uri("profile_1").contains("<s:Fault>"),
+            "default tokens no longer match"
+        );
+        // Media2 uses the same names.
+        let media2 = soap_response_media2(
+            Some("GetProfiles"),
+            &config,
+            "<tr2:GetProfiles><tr2:Token>cam-0-sub</tr2:Token></tr2:GetProfiles>",
+        );
+        assert!(media2.contains(r#"<tr2:Profiles token="cam-0-sub""#));
+        assert!(!media2.contains("cam-0-main"));
+    }
+
+    #[test]
+    fn default_naming_is_unchanged_by_the_logent_option() {
+        let profiles = get_profiles(&two_stream_config());
+        assert!(profiles.contains(r#"token="profile_1""#));
+        assert!(profiles.contains(r#"token="video_encoder_config_2""#));
+        assert!(!profiles.contains("cam-0"));
     }
 
     #[test]

@@ -317,3 +317,17 @@ Cameras are video-only by default. `audio = "pcmu" | "pcma" | "g722"` (CLI `--au
 ## Stopping
 
 Ctrl+C, and on Unix `SIGTERM` / `SIGHUP`, or the console close, logoff and shutdown events on Windows, stop the app cleanly: the ffmpeg processes are stopped with it. Killing the app by force (`kill -9`, `taskkill /F`) cannot be caught and leaves its ffmpeg processes running; stop those by hand.
+
+## Naming
+
+By default a camera names things in its own way: ONVIF profiles `profile_1` / `profile_2`, configurations `video_source_config_1` / `video_encoder_config_1`, and the RTSP paths `/live` / `/live_sub`. `naming = "logent"` (CLI `--naming logent`, TOML `[defaults]` with per-camera override) switches to the names of a logent camera, so tests that compare against logent or hard-code its names keep working:
+
+| | `default` | `logent` |
+|---|---|---|
+| Profiles | `profile_1`, `profile_2` | `cam-0-main`, `cam-0-sub` (named `Cam_main`, `Cam_sub`) |
+| Video source / its configuration | `video_source_1` / `video_source_config_1` | `cam-0` / `cam-0-vcfg` (`Cam_vsrc`) |
+| Video encoders | `video_encoder_config_1`, `_2` | `cam-0-venc-main`, `cam-0-venc-sub` (`Cam_vmain`, `Cam_vsub`) |
+| Audio source / configuration / encoder | `audio_source_1` / `audio_source_config_1` / `audio_encoder_config_1` | `cam-0-a` / `cam-0-acfg` / `cam-0-aenc` (`Cam_asrc`, `Cam_a`) |
+| RTSP paths | `/live`, `/live_sub` | `/cam-0_m`, `/cam-0_s` |
+
+The tokens are the same for every camera (each camera is its own ONVIF device). An explicit `rtsp_path` / `sub_rtsp_path` always wins over the naming's path. Media1 and Media2 use the same names.

@@ -2,10 +2,8 @@
 //! H.265. Media1 reports an HEVC stream as H.264 Baseline (see `video_encoder_configuration_xml`).
 
 use super::{
-    action_not_supported_fault, bitrate_limit, profile_name, profile_token, request_value,
-    requested_stream, rtsp_uri, snapshot_uri, soap_fault, video_encoder_config_token,
-    AUDIO_ENCODER_CONFIG_TOKEN, AUDIO_SOURCE_CONFIG_TOKEN, AUDIO_SOURCE_TOKEN,
-    VIDEO_SOURCE_CONFIG_TOKEN, VIDEO_SOURCE_TOKEN,
+    action_not_supported_fault, bitrate_limit, names, profile_name, request_value,
+    requested_stream, rtsp_uri, snapshot_uri, soap_fault,
 };
 use crate::config::{Config, Stream, VideoFormat};
 use crate::util;
@@ -73,8 +71,9 @@ fn selected_streams(
     let selected: Vec<(usize, Stream)> = streams
         .into_iter()
         .filter(|(index, _)| {
-            profile.is_none_or(|token| profile_token(*index) == token)
-                && configuration.is_none_or(|token| video_encoder_config_token(*index) == token)
+            profile.is_none_or(|token| names(config).profile_token(*index) == token)
+                && configuration
+                    .is_none_or(|token| names(config).video_encoder_token(*index) == token)
         })
         .collect();
 
@@ -101,7 +100,7 @@ fn get_profiles(config: &Config, request: &str) -> String {
 
 fn profile_xml(config: &Config, index: usize, stream: &Stream) -> String {
     let name = util::xml_escape(&profile_name(config, index, stream));
-    let token = profile_token(index);
+    let token = names(config).profile_token(index);
 
     let audio_source = audio_source_xml(config, "tr2:AudioSource");
     let audio_encoder = audio_encoder_xml(config, "tr2:AudioEncoder");
@@ -115,7 +114,7 @@ fn profile_xml(config: &Config, index: usize, stream: &Stream) -> String {
     </tr2:Configurations>
   </tr2:Profiles>"#,
         video_source_xml(config, "tr2:VideoSource"),
-        video_encoder_xml(index, stream, "tr2:VideoEncoder")
+        video_encoder_xml(config, index, stream, "tr2:VideoEncoder")
     )
 }
 
@@ -125,14 +124,18 @@ fn audio_source_xml(config: &Config, element: &str) -> String {
         return String::new();
     }
 
+    let names = names(config);
     format!(
         r#"
-      <{element} token="{AUDIO_SOURCE_CONFIG_TOKEN}">
-        <tt:Name>AudioSourceConfig</tt:Name>
+      <{element} token="{}">
+        <tt:Name>{}</tt:Name>
         <tt:UseCount>{}</tt:UseCount>
-        <tt:SourceToken>{AUDIO_SOURCE_TOKEN}</tt:SourceToken>
+        <tt:SourceToken>{}</tt:SourceToken>
       </{element}>"#,
-        config.streams().len()
+        names.audio_source_config_token(),
+        names.audio_source_config_name(),
+        config.streams().len(),
+        names.audio_source_token()
     )
 }
 
@@ -144,8 +147,8 @@ fn audio_encoder_xml(config: &Config, element: &str) -> String {
 
     format!(
         r#"
-      <{element} token="{AUDIO_ENCODER_CONFIG_TOKEN}">
-        <tt:Name>AudioEncoder</tt:Name>
+      <{element} token="{}">
+        <tt:Name>{}</tt:Name>
         <tt:UseCount>{}</tt:UseCount>
         <tt:Encoding>{}</tt:Encoding>
         <tt:Multicast>
@@ -160,6 +163,8 @@ fn audio_encoder_xml(config: &Config, element: &str) -> String {
         <tt:Bitrate>{}</tt:Bitrate>
         <tt:SampleRate>{}</tt:SampleRate>
       </{element}>"#,
+        names(config).audio_encoder_token(),
+        names(config).audio_encoder_name(),
         config.streams().len(),
         codec.media2_encoding(),
         codec.bitrate_kbps(),
@@ -168,14 +173,18 @@ fn audio_encoder_xml(config: &Config, element: &str) -> String {
 }
 
 fn video_source_xml(config: &Config, element: &str) -> String {
+    let names = names(config);
     format!(
-        r#"<{element} token="{VIDEO_SOURCE_CONFIG_TOKEN}">
-      <tt:Name>VideoSourceConfig</tt:Name>
+        r#"<{element} token="{}">
+      <tt:Name>{}</tt:Name>
       <tt:UseCount>{}</tt:UseCount>
-      <tt:SourceToken>{VIDEO_SOURCE_TOKEN}</tt:SourceToken>
+      <tt:SourceToken>{}</tt:SourceToken>
       <tt:Bounds x="0" y="0" width="{}" height="{}"/>
     </{element}>"#,
+        names.video_source_config_token(),
+        names.video_source_config_name(),
         config.streams().len(),
+        names.video_source_token(),
         config.width,
         config.height
     )
@@ -183,15 +192,14 @@ fn video_source_xml(config: &Config, element: &str) -> String {
 
 /// `tt:VideoEncoder2Configuration`; `element` is the wrapper name (`tr2:VideoEncoder` inside a
 /// profile, `tr2:Configurations` in `GetVideoEncoderConfigurations`).
-fn video_encoder_xml(index: usize, stream: &Stream, element: &str) -> String {
+fn video_encoder_xml(config: &Config, index: usize, stream: &Stream, element: &str) -> String {
     let format = stream.format();
-    let token = video_encoder_config_token(index);
-    let name = match (format, index == 0) {
-        (VideoFormat::H264, true) => "H264Encoder",
-        (VideoFormat::H264, false) => "H264EncoderSub",
-        (VideoFormat::H265, true) => "H265Encoder",
-        (VideoFormat::H265, false) => "H265EncoderSub",
+    let token = names(config).video_encoder_token(index);
+    let family = match format {
+        VideoFormat::H264 => "H264",
+        VideoFormat::H265 => "H265",
     };
+    let name = names(config).video_encoder_name(index, family);
 
     format!(
         r#"<{element} token="{token}" GovLength="{}" Profile="{}">
@@ -232,7 +240,9 @@ fn get_video_encoder_configurations(config: &Config, request: &str) -> String {
         Ok(streams) => {
             let configurations = streams
                 .iter()
-                .map(|(index, stream)| video_encoder_xml(*index, stream, "tr2:Configurations"))
+                .map(|(index, stream)| {
+                    video_encoder_xml(config, *index, stream, "tr2:Configurations")
+                })
                 .collect::<Vec<_>>()
                 .join("\n  ");
             format!(

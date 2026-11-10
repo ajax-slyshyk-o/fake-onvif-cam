@@ -57,6 +57,8 @@ pub struct Config {
     pub audio: Option<AudioCodec>,
     /// The main video file has an audio track to use (set at startup); otherwise silence.
     pub audio_from_file: bool,
+    /// Names of ONVIF tokens and default RTSP paths.
+    pub naming: Naming,
     pub overlay_text: Option<String>,
     pub overlay_font: Option<PathBuf>,
     pub overlay_font_size: u32,
@@ -99,6 +101,44 @@ impl VideoFormat {
             VideoFormat::H265
         } else {
             VideoFormat::H264
+        }
+    }
+}
+
+/// How a camera names its ONVIF profiles, configurations and RTSP paths.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Naming {
+    /// `profile_1`, `video_encoder_config_1`, `/live`, `/live_sub`.
+    #[default]
+    Default,
+    /// The names of logent's cameras: `cam-0-main`, `cam-0-venc-main`, `/cam-0_m`, `/cam-0_s`.
+    Logent,
+}
+
+impl Naming {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "default" => Ok(Self::Default),
+            "logent" => Ok(Self::Logent),
+            other => Err(format!(
+                "unknown naming \"{other}\" (use default or logent)"
+            )),
+        }
+    }
+
+    /// RTSP path of the main stream unless one is configured.
+    fn main_rtsp_path(self) -> &'static str {
+        match self {
+            Self::Default => "live",
+            Self::Logent => "cam-0_m",
+        }
+    }
+
+    /// RTSP path of the sub stream unless one is configured.
+    fn sub_rtsp_path(self) -> &'static str {
+        match self {
+            Self::Default => SUB_DEFAULT_RTSP_PATH,
+            Self::Logent => "cam-0_s",
         }
     }
 }
@@ -348,6 +388,7 @@ struct SubOptions {
     codec: Option<String>,
     preset: Option<String>,
     file: Option<PathBuf>,
+    naming: Naming,
 }
 
 impl SubOptions {
@@ -377,7 +418,7 @@ impl SubOptions {
             rtsp_path: self
                 .rtsp_path
                 .map(|value| trim_rtsp_path(&value))
-                .unwrap_or_else(|| SUB_DEFAULT_RTSP_PATH.to_string()),
+                .unwrap_or_else(|| self.naming.sub_rtsp_path().to_string()),
             rtp_port: self
                 .rtp_port
                 .map(|port| parse_rtp_port(&port.to_string()))
@@ -411,8 +452,8 @@ struct Cli {
     rtsp_port: u16,
 
     /// RTSP path.
-    #[arg(long = "rtsp-path", default_value = "live", value_parser = parse_rtsp_path)]
-    rtsp_path: String,
+    #[arg(long = "rtsp-path", value_parser = parse_rtsp_path)]
+    rtsp_path: Option<String>,
 
     /// Local RTP ingest port for ffmpeg. The following port is used for RTCP.
     #[arg(long = "rtp-port", default_value_t = 5004, value_parser = parse_rtp_port)]
@@ -496,6 +537,11 @@ struct Cli {
     /// when that has audio, otherwise it is silence. Off by default.
     #[arg(long = "audio", value_parser = AudioCodec::parse)]
     audio: Option<AudioCodec>,
+
+    /// Names of ONVIF profiles/tokens and default RTSP paths: `default` (profile_1, /live, ...)
+    /// or `logent` (cam-0-main, /cam-0_m, ...). An explicit --rtsp-path always wins.
+    #[arg(long = "naming", value_parser = Naming::parse)]
+    naming: Option<Naming>,
 
     /// Text burned into the video. Defaults to the camera name.
     #[arg(long = "overlay-text")]
@@ -611,6 +657,7 @@ struct TomlCamera {
     auth: Option<bool>,
     snapshot: Option<bool>,
     audio: Option<String>,
+    naming: Option<String>,
     overlay_text: Option<String>,
     overlay_font: Option<PathBuf>,
     overlay_font_size: Option<u32>,
@@ -685,6 +732,7 @@ impl TryFrom<Cli> for Config {
 
     fn try_from(cli: Cli) -> Result<Self, String> {
         validate_main_codec(&cli.codec)?;
+        let naming = cli.naming.unwrap_or_default();
         let sub = SubOptions {
             enabled: cli.sub_stream,
             width: cli.sub_width,
@@ -696,6 +744,7 @@ impl TryFrom<Cli> for Config {
             codec: cli.sub_codec.clone(),
             preset: cli.sub_preset.clone(),
             file: cli.sub_file.clone(),
+            naming: cli.naming.unwrap_or_default(),
         }
         .into_sub_stream()?;
 
@@ -715,7 +764,9 @@ impl TryFrom<Cli> for Config {
             http_addr: cli.http_addr,
             advertise_host: cli.advertise_host.unwrap_or_else(default_advertise_host),
             rtsp_port: cli.rtsp_port,
-            rtsp_path: cli.rtsp_path,
+            rtsp_path: cli
+                .rtsp_path
+                .unwrap_or_else(|| naming.main_rtsp_path().to_string()),
             rtp_port: cli.rtp_port,
             ffmpeg_path: cli.ffmpeg_path,
             media_input: cli
@@ -738,6 +789,7 @@ impl TryFrom<Cli> for Config {
             no_snapshot: cli.no_snapshot,
             audio: cli.audio,
             audio_from_file: false,
+            naming,
             overlay_text,
             overlay_font: if cli.no_overlay {
                 None
@@ -802,10 +854,15 @@ fn camera_from_toml(
             .parse()
             .expect("valid default socket address"),
     );
+    let naming = choose_optional_string(&camera.naming, &defaults.naming)
+        .map(|value| Naming::parse(&value))
+        .transpose()
+        .map_err(|err| format!("camera {}: {err}", index + 1))?
+        .unwrap_or_default();
     let rtsp_path = choose_optional_string(&camera.rtsp_path, &defaults.rtsp_path)
         .map(|value| parse_rtsp_path(&value))
         .transpose()?
-        .unwrap_or_else(|| "live".to_string());
+        .unwrap_or_else(|| naming.main_rtsp_path().to_string());
     let rtp_port =
         parse_rtp_port(&choose_copy(&camera.rtp_port, &defaults.rtp_port, 5004).to_string())?;
     let width = validate_non_zero(
@@ -881,6 +938,7 @@ fn camera_from_toml(
             .transpose()
             .map_err(|err| format!("camera {}: {err}", index + 1))?,
         audio_from_file: false,
+        naming,
         overlay_text,
         overlay_font,
         overlay_font_size: validate_non_zero(
@@ -901,6 +959,7 @@ fn camera_from_toml(
             preset: choose_optional_string(&camera.sub_preset, &defaults.sub_preset),
             file: choose_optional_path(&camera.sub_file, &defaults.sub_file)
                 .map(|path| resolve_config_path(base_dir, path)),
+            naming,
         }
         .into_sub_stream()
         .map_err(|err| format!("camera {}: {err}", index + 1))?,
@@ -943,6 +1002,7 @@ impl Default for Config {
             no_snapshot: false,
             audio: None,
             audio_from_file: false,
+            naming: Naming::Default,
             overlay_text: Some("Fake ONVIF Camera".to_string()),
             overlay_font: default_overlay_font(),
             overlay_font_size: 32,
@@ -1365,5 +1425,36 @@ mod tests {
         assert!(parse("[[cameras]]\naudio = \"aac\"\n")
             .unwrap_err()
             .contains("camera 1"));
+    }
+
+    #[test]
+    fn naming_sets_default_rtsp_paths_but_explicit_paths_win() {
+        let parse = |body: &str| {
+            let config: TomlConfig = toml::from_str(body).unwrap();
+            camera_from_toml(&config.defaults, &config.cameras[0], 0, Path::new("/cfg")).unwrap()
+        };
+
+        let plain = parse("[[cameras]]\nsub_stream = true\n");
+        assert_eq!(plain.naming, Naming::Default);
+        assert_eq!(plain.streams()[0].rtsp_path, "live");
+        assert_eq!(plain.streams()[1].rtsp_path, "live_sub");
+
+        let logent = parse("[defaults]\nnaming = \"logent\"\n[[cameras]]\nsub_stream = true\n");
+        assert_eq!(logent.streams()[0].rtsp_path, "cam-0_m");
+        assert_eq!(logent.streams()[1].rtsp_path, "cam-0_s");
+
+        let explicit = parse(
+            "[[cameras]]\nnaming = \"logent\"\nrtsp_path = \"main\"\nsub_stream = true\nsub_rtsp_path = \"low\"\n",
+        );
+        assert_eq!(explicit.streams()[0].rtsp_path, "main");
+        assert_eq!(explicit.streams()[1].rtsp_path, "low");
+    }
+
+    #[test]
+    fn naming_parse_rejects_unknown_schemes() {
+        assert_eq!(Naming::parse("Logent"), Ok(Naming::Logent));
+        assert!(Naming::parse("onvif")
+            .unwrap_err()
+            .contains("default or logent"));
     }
 }

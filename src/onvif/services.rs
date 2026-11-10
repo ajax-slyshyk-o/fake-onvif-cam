@@ -3,7 +3,7 @@
 //! image settings; the Events service accepts pull-point subscriptions and always answers
 //! with an empty batch.
 
-use super::{action_not_supported_fault, request_value, soap_fault, Service, VIDEO_SOURCE_TOKEN};
+use super::{action_not_supported_fault, names, request_value, soap_fault, Service};
 use crate::config::Config;
 use crate::util;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,7 +35,7 @@ pub fn soap_body(
                 .to_string()
         }
         (Service::Imaging, "GetImagingSettings") => {
-            if request_value(request, "VideoSourceToken").is_some_and(|token| token != VIDEO_SOURCE_TOKEN) {
+            if request_value(request, "VideoSourceToken").is_some_and(|token| token != names(config).video_source_token()) {
                 return soap_fault("No such video source");
             }
             r#"<timg:GetImagingSettingsResponse>
@@ -172,7 +172,10 @@ mod tests {
         let ok = call(
             Service::Imaging,
             "GetImagingSettings",
-            &format!("<timg:VideoSourceToken>{VIDEO_SOURCE_TOKEN}</timg:VideoSourceToken>"),
+            &format!(
+                "<timg:VideoSourceToken>{}</timg:VideoSourceToken>",
+                names(&Config::default()).video_source_token()
+            ),
         );
         assert!(ok.contains("<tt:Brightness>"));
         let bad = call(

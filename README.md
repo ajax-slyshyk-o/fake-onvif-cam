@@ -221,11 +221,13 @@ Ready-made examples in the repository:
 
 ## Export the camera list
 
-`--export-cameras` prints the resolved camera list (name, UUID, advertise host, HTTP port) as JSON and exits without starting any services. Other tools can use it to register the fake cameras elsewhere:
+`--export-cameras` prints the resolved camera list (name, UUID, advertise host, HTTP port, plus `username`/`password` when configured) as JSON and exits without starting any services. Other tools can use it to register the fake cameras elsewhere:
 
 ```powershell
 cargo run -- --config cameras.toml --export-cameras cameras.json
 ```
+
+`username` / `password` (CLI `--username`/`--password`, or TOML `[defaults]` with per-camera override) are only exported for provisioning; the emulator never checks them.
 
 ```json
 {

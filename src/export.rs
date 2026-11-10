@@ -21,12 +21,22 @@ fn render(configs: &[Config]) -> String {
 }
 
 fn camera_json(config: &Config) -> String {
+    let mut credentials = String::new();
+    for (key, value) in [("username", &config.username), ("password", &config.password)] {
+        if let Some(value) = value {
+            credentials.push_str(&format!(
+                ",\n      \"{key}\": \"{}\"",
+                util::json_escape(value)
+            ));
+        }
+    }
     format!(
-        "    {{\n      \"name\": \"{}\",\n      \"uuid\": \"{}\",\n      \"advertise_host\": \"{}\",\n      \"http_port\": {}\n    }}",
+        "    {{\n      \"name\": \"{}\",\n      \"uuid\": \"{}\",\n      \"advertise_host\": \"{}\",\n      \"http_port\": {}{}\n    }}",
         util::json_escape(&config.camera_name),
         util::json_escape(&config.uuid),
         util::json_escape(&config.advertise_host),
-        config.http_addr.port()
+        config.http_addr.port(),
+        credentials
     )
 }
 
@@ -69,5 +79,14 @@ mod tests {
 }
 "#;
         assert_eq!(render(&configs), expected);
+    }
+
+    #[test]
+    fn renders_credentials_when_set() {
+        let mut config = camera("Cam", "00000000-0000-4550-98a8-98a80cab1b88", 8000);
+        config.username = Some("admin".to_string());
+        config.password = Some("p\"w".to_string());
+        let json = render(&[config]);
+        assert!(json.contains("\"http_port\": 8000,\n      \"username\": \"admin\",\n      \"password\": \"p\\\"w\"\n"));
     }
 }

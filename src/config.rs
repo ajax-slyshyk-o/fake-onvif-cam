@@ -46,6 +46,9 @@ pub struct Config {
     pub model: String,
     pub firmware: String,
     pub serial: String,
+    /// ONVIF credentials; only exported for NVR provisioning, never checked.
+    pub username: Option<String>,
+    pub password: Option<String>,
     pub overlay_text: Option<String>,
     pub overlay_font: Option<PathBuf>,
     pub overlay_font_size: u32,
@@ -328,6 +331,14 @@ struct Cli {
     #[arg(long = "serial", default_value = "FAKE-ONVIF-001")]
     serial: String,
 
+    /// ONVIF username written to the exported camera list (not enforced).
+    #[arg(long = "username")]
+    username: Option<String>,
+
+    /// ONVIF password written to the exported camera list (not enforced).
+    #[arg(long = "password")]
+    password: Option<String>,
+
     /// Text burned into the video. Defaults to the camera name.
     #[arg(long = "overlay-text")]
     overlay_text: Option<String>,
@@ -432,6 +443,8 @@ struct TomlCamera {
     model: Option<String>,
     firmware: Option<String>,
     serial: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
     overlay_text: Option<String>,
     overlay_font: Option<PathBuf>,
     overlay_font_size: Option<u32>,
@@ -549,6 +562,8 @@ impl TryFrom<Cli> for Config {
             model: cli.model,
             firmware: cli.firmware,
             serial: cli.serial,
+            username: cli.username,
+            password: cli.password,
             overlay_text,
             overlay_font: if cli.no_overlay {
                 None
@@ -676,6 +691,8 @@ fn camera_from_toml(
             env!("CARGO_PKG_VERSION"),
         ),
         serial: choose_string(&camera.serial, &defaults.serial, "FAKE-ONVIF-001"),
+        username: choose_optional_string(&camera.username, &defaults.username),
+        password: choose_optional_string(&camera.password, &defaults.password),
         overlay_text,
         overlay_font,
         overlay_font_size: validate_non_zero(
@@ -726,6 +743,8 @@ impl Default for Config {
             model: "FakeCam Rust".to_string(),
             firmware: env!("CARGO_PKG_VERSION").to_string(),
             serial: "FAKE-ONVIF-001".to_string(),
+            username: None,
+            password: None,
             overlay_text: Some("Fake ONVIF Camera".to_string()),
             overlay_font: default_overlay_font(),
             overlay_font_size: 32,

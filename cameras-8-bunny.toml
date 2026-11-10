@@ -1,6 +1,6 @@
 [defaults]
-advertise_host = "10.42.0.44"
-ffmpeg = "d:/bin/ffmpeg-8.1-full_build/bin/ffmpeg.exe"
+advertise_host = "192.168.0.100"
+ffmpeg = "ffmpeg"
 # Fallback media file. A camera can override this with its own file entry.
 file = "/home/user/projects/ajax/nvr/vms-i386-release/out/bin/bunny2.mkv"
 width = 1280

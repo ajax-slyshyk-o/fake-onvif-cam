@@ -290,3 +290,16 @@ This is a login check for NVR testing, not security: nonces are stateless, there
 ## Cameras without snapshots
 
 `--no-snapshot` (TOML `snapshot = false`) makes a camera behave like one that has no snapshot support: `GetSnapshotUri` (Media and Media2) returns `ter:ActionNotSupported`, the media capabilities report `SnapshotUri="false"`, and `/snapshot.jpg` returns 404. Use it to check that the NVR copes with a missing snapshot. By default the snapshot is the 1x1 stub image.
+
+## Extra ONVIF services
+
+Besides Device and Media (and Media2 for H.265), every camera answers four small services at the paths a real camera uses, and lists them in `GetServices` and `GetCapabilities`:
+
+| Path | Service | What it does |
+|------|---------|--------------|
+| `/onvif/imaging_service` | Imaging | capabilities, default `GetImagingSettings` |
+| `/onvif/deviceIO_service` | DeviceIO | capabilities: 1 video source, no audio, relays or inputs |
+| `/onvif/analytics_service` | Analytics | capabilities only (no rules, no modules) |
+| `/onvif/event_service` | Events | capabilities, `GetEventProperties` (empty topic set), pull-point subscriptions |
+
+The Events service accepts `CreatePullPointSubscription`, `PullMessages`, `Renew` and `Unsubscribe`. There are never any events: `PullMessages` waits for the requested `Timeout` (at most 5 s) and returns an empty batch, so an NVR keeps its subscription alive without being flooded. Any other operation of these services returns `ter:ActionNotSupported`. They share the authentication of the other services.

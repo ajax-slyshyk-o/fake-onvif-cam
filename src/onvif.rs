@@ -1,4 +1,7 @@
 mod media2;
+mod services;
+
+pub use services::pull_wait;
 
 use crate::config::{Config, Stream};
 use crate::util;
@@ -41,19 +44,11 @@ fn requested_stream(config: &Config, request: &str) -> Result<(usize, Stream), S
 }
 
 pub fn device_xaddr(config: &Config) -> String {
-    format!(
-        "http://{}:{}/onvif/device_service",
-        config.advertise_host,
-        config.http_addr.port()
-    )
+    Service::Device.xaddr(config)
 }
 
 pub fn media_xaddr(config: &Config) -> String {
-    format!(
-        "http://{}:{}/onvif/media_service",
-        config.advertise_host,
-        config.http_addr.port()
-    )
+    Service::Media.xaddr(config)
 }
 
 /// Media2 is only offered when a stream needs it (H.265); H.264-only cameras stay Media1.
@@ -112,6 +107,12 @@ pub fn detect_operation(xml: &str) -> Option<String> {
         "GetVideoEncoderConfigurations",
         "GetVideoEncoderConfigurationOptions",
         "GetCompatibleVideoEncoderConfigurations",
+        "GetEventProperties",
+        "CreatePullPointSubscription",
+        "PullMessages",
+        "Renew",
+        "Unsubscribe",
+        "GetImagingSettings",
         "GetMetadataConfigurations",
         "GetAudioSources",
         "GetAudioEncoderConfigurations",
@@ -177,6 +178,62 @@ pub fn discovery_probe_match(config: &Config, relates_to: &str) -> String {
 pub enum Service {
     Device,
     Media,
+    Imaging,
+    DeviceIo,
+    Analytics,
+    Events,
+}
+
+impl Service {
+    /// The services served by [`services::soap_body`] (everything but Device and Media).
+    const EXTRA: [Service; 4] = [
+        Service::Imaging,
+        Service::DeviceIo,
+        Service::Analytics,
+        Service::Events,
+    ];
+
+    pub fn from_path(path: &str) -> Option<Self> {
+        [Self::Device, Self::Media]
+            .into_iter()
+            .chain(Self::EXTRA)
+            .find(|service| service.path() == path)
+    }
+
+    pub fn path(self) -> &'static str {
+        match self {
+            Self::Device => "/onvif/device_service",
+            Self::Media => "/onvif/media_service",
+            Self::Imaging => "/onvif/imaging_service",
+            Self::DeviceIo => "/onvif/deviceIO_service",
+            Self::Analytics => "/onvif/analytics_service",
+            Self::Events => "/onvif/event_service",
+        }
+    }
+
+    fn namespace(self) -> &'static str {
+        match self {
+            Self::Device => "http://www.onvif.org/ver10/device/wsdl",
+            Self::Media => "http://www.onvif.org/ver10/media/wsdl",
+            Self::Imaging => "http://www.onvif.org/ver20/imaging/wsdl",
+            Self::DeviceIo => "http://www.onvif.org/ver10/deviceIO/wsdl",
+            Self::Analytics => "http://www.onvif.org/ver20/analytics/wsdl",
+            Self::Events => "http://www.onvif.org/ver10/events/wsdl",
+        }
+    }
+
+    fn xaddr(self, config: &Config) -> String {
+        format!(
+            "http://{}:{}{}",
+            config.advertise_host,
+            config.http_addr.port(),
+            self.path()
+        )
+    }
+}
+
+fn event_xaddr(config: &Config) -> String {
+    Service::Events.xaddr(config)
 }
 
 /// Response of the Media service (`/onvif/media_service`).
@@ -192,6 +249,10 @@ pub fn soap_response_for_service(
     config: &Config,
     request: &str,
 ) -> String {
+    if Service::EXTRA.contains(&service) {
+        return envelope(&services::soap_body(service, operation, config, request));
+    }
+
     let body = match operation {
         Some("GetCapabilities") => get_capabilities(config),
         Some("GetDeviceInformation") => get_device_information(config),
@@ -256,7 +317,7 @@ pub fn soap_response_for_service(
             .unwrap_or_else(|reason| soap_fault(&reason)),
         Some("GetServiceCapabilities") => match service {
             Service::Device => get_device_service_capabilities(config),
-            Service::Media => get_media_service_capabilities(config),
+            _ => get_media_service_capabilities(config),
         },
         Some("SetSynchronizationPoint") => "<trt:SetSynchronizationPointResponse/>".to_string(),
         Some(other) => soap_fault(&format!("Unsupported ONVIF operation: {other}")),
@@ -279,6 +340,13 @@ fn envelope(body: &str) -> String {
             xmlns:trt="http://www.onvif.org/ver10/media/wsdl"
             xmlns:tr2="http://www.onvif.org/ver20/media/wsdl"
             xmlns:tt="http://www.onvif.org/ver10/schema"
+            xmlns:timg="http://www.onvif.org/ver20/imaging/wsdl"
+            xmlns:tmd="http://www.onvif.org/ver10/deviceIO/wsdl"
+            xmlns:tan="http://www.onvif.org/ver20/analytics/wsdl"
+            xmlns:tev="http://www.onvif.org/ver10/events/wsdl"
+            xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2"
+            xmlns:wstop="http://docs.oasis-open.org/wsn/t-1"
+            xmlns:wsa5="http://www.w3.org/2005/08/addressing"
             xmlns:ter="http://www.onvif.org/ver10/error">
   <s:Body>
     {body}
@@ -290,10 +358,19 @@ fn envelope(body: &str) -> String {
 fn get_capabilities(config: &Config) -> String {
     let device = util::xml_escape(&device_xaddr(config));
     let media = util::xml_escape(&media_xaddr(config));
+    let analytics = util::xml_escape(&Service::Analytics.xaddr(config));
+    let events = util::xml_escape(&Service::Events.xaddr(config));
+    let imaging = util::xml_escape(&Service::Imaging.xaddr(config));
+    let device_io = util::xml_escape(&Service::DeviceIo.xaddr(config));
 
     format!(
         r#"<tds:GetCapabilitiesResponse>
   <tds:Capabilities>
+    <tt:Analytics>
+      <tt:XAddr>{analytics}</tt:XAddr>
+      <tt:RuleSupport>false</tt:RuleSupport>
+      <tt:AnalyticsModuleSupport>false</tt:AnalyticsModuleSupport>
+    </tt:Analytics>
     <tt:Device>
       <tt:XAddr>{device}</tt:XAddr>
       <tt:Network>
@@ -311,6 +388,15 @@ fn get_capabilities(config: &Config) -> String {
         <tt:FirmwareUpgrade>false</tt:FirmwareUpgrade>
       </tt:System>
     </tt:Device>
+    <tt:Events>
+      <tt:XAddr>{events}</tt:XAddr>
+      <tt:WSSubscriptionPolicySupport>false</tt:WSSubscriptionPolicySupport>
+      <tt:WSPullPointSupport>true</tt:WSPullPointSupport>
+      <tt:WSPausableSubscriptionManagerInterfaceSupport>false</tt:WSPausableSubscriptionManagerInterfaceSupport>
+    </tt:Events>
+    <tt:Imaging>
+      <tt:XAddr>{imaging}</tt:XAddr>
+    </tt:Imaging>
     <tt:Media>
       <tt:XAddr>{media}</tt:XAddr>
       <tt:StreamingCapabilities>
@@ -319,6 +405,16 @@ fn get_capabilities(config: &Config) -> String {
         <tt:RTP_RTSP_TCP>true</tt:RTP_RTSP_TCP>
       </tt:StreamingCapabilities>
     </tt:Media>
+    <tt:Extension>
+      <tt:DeviceIO>
+        <tt:XAddr>{device_io}</tt:XAddr>
+        <tt:VideoSources>1</tt:VideoSources>
+        <tt:VideoOutputs>0</tt:VideoOutputs>
+        <tt:AudioSources>0</tt:AudioSources>
+        <tt:AudioOutputs>0</tt:AudioOutputs>
+        <tt:RelayOutputs>0</tt:RelayOutputs>
+      </tt:DeviceIO>
+    </tt:Extension>
   </tds:Capabilities>
 </tds:GetCapabilitiesResponse>"#
     )
@@ -359,6 +455,22 @@ fn get_services(config: &Config) -> String {
         })
         .unwrap_or_default();
 
+    let extra: String = Service::EXTRA
+        .iter()
+        .map(|service| {
+            format!(
+                r#"
+  <tds:Service>
+    <tds:Namespace>{}</tds:Namespace>
+    <tds:XAddr>{}</tds:XAddr>
+    <tds:Version><tt:Major>2</tt:Major><tt:Minor>0</tt:Minor></tds:Version>
+  </tds:Service>"#,
+                service.namespace(),
+                util::xml_escape(&service.xaddr(config))
+            )
+        })
+        .collect();
+
     format!(
         r#"<tds:GetServicesResponse>
   <tds:Service>
@@ -370,7 +482,7 @@ fn get_services(config: &Config) -> String {
     <tds:Namespace>http://www.onvif.org/ver10/media/wsdl</tds:Namespace>
     <tds:XAddr>{media}</tds:XAddr>
     <tds:Version><tt:Major>2</tt:Major><tt:Minor>0</tt:Minor></tds:Version>
-  </tds:Service>{media2}
+  </tds:Service>{media2}{extra}
 </tds:GetServicesResponse>"#
     )
 }

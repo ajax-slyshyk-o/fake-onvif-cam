@@ -87,6 +87,38 @@ pub fn utc_parts() -> (i64, i64, i64, i64, i64, i64) {
     unix_seconds_to_utc(seconds)
 }
 
+/// Current UTC time plus `offset_seconds` as an `xs:dateTime`, e.g. `2026-11-10T12:00:00Z`.
+pub fn utc_iso(offset_seconds: i64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let (year, month, day, hour, minute, second) = unix_seconds_to_utc(now + offset_seconds);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Parses an `xs:duration` of the time-only form `PT#H#M#S` (seconds may be fractional).
+pub fn parse_xs_duration(value: &str) -> Option<std::time::Duration> {
+    let mut rest = value.trim().strip_prefix("PT")?;
+    let mut seconds = 0.0_f64;
+    let mut any = false;
+    while !rest.is_empty() {
+        let end = rest.find(|c: char| c.is_ascii_alphabetic())?;
+        let amount: f64 = rest[..end].parse().ok()?;
+        seconds += amount
+            * match &rest[end..=end] {
+                "H" => 3600.0,
+                "M" => 60.0,
+                "S" => 1.0,
+                _ => return None,
+            };
+        rest = &rest[end + 1..];
+        any = true;
+    }
+    (any && seconds.is_finite() && seconds >= 0.0)
+        .then(|| std::time::Duration::from_secs_f64(seconds))
+}
+
 fn unix_seconds_to_utc(seconds: i64) -> (i64, i64, i64, i64, i64, i64) {
     let days = seconds.div_euclid(86_400);
     let seconds_of_day = seconds.rem_euclid(86_400);
@@ -118,6 +150,37 @@ fn civil_from_days(days_since_unix_epoch: i64) -> (i64, i64, i64) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn xs_duration_parsing() {
+        use std::time::Duration;
+        assert_eq!(
+            super::parse_xs_duration("PT5S"),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            super::parse_xs_duration("PT1M30S"),
+            Some(Duration::from_secs(90))
+        );
+        assert_eq!(
+            super::parse_xs_duration("PT0.5S"),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(
+            super::parse_xs_duration("PT1H"),
+            Some(Duration::from_secs(3600))
+        );
+        for bad in ["", "PT", "5S", "P1D", "PT-5S", "PTxS"] {
+            assert_eq!(super::parse_xs_duration(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn utc_iso_has_the_xs_datetime_shape() {
+        let value = super::utc_iso(0);
+        assert_eq!(value.len(), 20, "{value}");
+        assert!(value.ends_with('Z') && value.as_bytes()[10] == b'T');
+    }
+
     use super::{json_escape, make_uuid, percent_encode};
 
     #[test]

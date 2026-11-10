@@ -20,6 +20,8 @@ const SNAPSHOT_JPEG: &[u8] = &[
     0x00, 0x00, 0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00, 0x37, 0xff, 0xd9,
 ];
 
+const MEDIA2_PATH: &str = "/onvif/media2_service";
+
 struct Request {
     method: String,
     path: String,
@@ -59,8 +61,9 @@ fn handle_client(mut stream: TcpStream, config: Arc<Config>) -> io::Result<()> {
     let path = request.path.split('?').next().unwrap_or(&request.path);
 
     let response = match (request.method.as_str(), path) {
-        ("POST", "/onvif/device_service" | "/onvif/media_service" | "/onvif/media2_service")
-            if !is_authorized(&request, &config) =>
+        ("POST", path)
+            if (onvif::Service::from_path(path).is_some() || path == MEDIA2_PATH)
+                && !is_authorized(&request, &config) =>
         {
             unauthorized_response()
         }
@@ -69,21 +72,23 @@ fn handle_client(mut stream: TcpStream, config: Arc<Config>) -> io::Result<()> {
             text_response(404, status_text(404), "not found\n".to_string())
         }
         ("GET", "/snapshot.jpg") => binary_response(200, "image/jpeg", SNAPSHOT_JPEG),
-        ("POST", "/onvif/device_service") => {
-            soap_response_for(onvif::Service::Device, &request.body, &config)
-        }
-        ("POST", "/onvif/media_service") => {
-            soap_response_for(onvif::Service::Media, &request.body, &config)
+        ("POST", path) if onvif::Service::from_path(path).is_some() => {
+            let service = onvif::Service::from_path(path).expect("checked above");
+            if service == onvif::Service::Events {
+                thread::sleep(onvif::pull_wait(
+                    &request.body,
+                    onvif::detect_operation(&request.body).as_deref(),
+                ));
+            }
+            soap_response_for(service, &request.body, &config)
         }
         // Media2 exists only on cameras that publish an H.265 stream.
-        ("POST", "/onvif/media2_service") if config.has_hevc() => {
+        ("POST", MEDIA2_PATH) if config.has_hevc() => {
             let operation = onvif::detect_operation(&request.body);
             let xml = onvif::soap_response_media2(operation.as_deref(), &config, &request.body);
             binary_response(200, "application/soap+xml; charset=utf-8", xml.as_bytes())
         }
-        ("GET", "/onvif/device_service")
-        | ("GET", "/onvif/media_service")
-        | ("GET", "/onvif/media2_service") => {
+        ("GET", path) if onvif::Service::from_path(path).is_some() || path == MEDIA2_PATH => {
             text_response(200, status_text(200), landing_text(&config))
         }
         _ => text_response(404, status_text(404), "not found\n".to_string()),

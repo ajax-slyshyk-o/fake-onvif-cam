@@ -799,6 +799,7 @@ mod tests {
                 rtp_port: None,
                 codec: "libx264".to_string(),
                 preset: None,
+                file: None,
             }),
             ..Config::default()
         }

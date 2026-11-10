@@ -60,6 +60,9 @@ fn main() -> process::ExitCode {
                     }
                 }
             }
+            if !cfg.no_ffmpeg {
+                ffmpeg::prepare_sub_file(&mut cfg);
+            }
             Arc::new(cfg)
         })
         .collect();

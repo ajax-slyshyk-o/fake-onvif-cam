@@ -1,7 +1,7 @@
 use crate::config::{Config, MediaInput, Stream};
 use std::io;
 use std::net::UdpSocket;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -215,6 +215,19 @@ fn spawn_child(config: &Config) -> io::Result<Child> {
         }
     }
 
+    // A prepared low-resolution video feeds the sub stream, so the main video is not scaled
+    // down at runtime.
+    let streams = config.streams();
+    let sub_file = config.sub.as_ref().and_then(|sub| sub.file.as_ref());
+    if let (Some(path), [_, _]) = (sub_file, streams.as_slice()) {
+        command
+            .arg("-re")
+            .arg("-stream_loop")
+            .arg("-1")
+            .arg("-i")
+            .arg(path);
+    }
+
     let mut vfilters: Vec<String> = Vec::new();
 
     if config.scale && matches!(config.media_input, MediaInput::File(_)) {
@@ -232,7 +245,6 @@ fn spawn_child(config: &Config) -> io::Result<Child> {
 
     // One process and one decode for all streams: the (overlaid) video is split and the
     // sub stream is scaled down from the copy.
-    let streams = config.streams();
     match streams.as_slice() {
         [main] => {
             if !vfilters.is_empty() {
@@ -241,9 +253,16 @@ fn spawn_child(config: &Config) -> io::Result<Child> {
             add_output(&mut command, main, 1);
         }
         [main, sub] => {
-            command
-                .arg("-filter_complex")
-                .arg(split_filter_graph(&vfilters, sub));
+            let graph = if sub_file.is_some() {
+                let sub_font_size = scaled_font_size(config.overlay_font_size, main, sub);
+                let sub_overlay = config.overlay_text.as_deref().map(|text| {
+                    drawtext_filter(text, config.overlay_font.as_deref(), sub_font_size)
+                });
+                separate_sub_graph(&vfilters, sub, sub_overlay.as_deref())
+            } else {
+                split_filter_graph(&vfilters, sub)
+            };
+            command.arg("-filter_complex").arg(graph);
             command.arg("-map").arg("[main]");
             add_output(&mut command, main, 1);
             command.arg("-map").arg("[sub]");
@@ -271,6 +290,137 @@ fn split_filter_graph(vfilters: &[String], sub: &Stream) -> String {
         "[0:v]{prefix}split=2[main][subraw];[subraw]scale={}:{},fps={}[sub]",
         sub.width, sub.height, sub.fps
     )
+}
+
+/// Filter graph with a separate input for the sub stream (`-i main -i sub_file`): no split and
+/// no scaling of the main video. The scale below is a pass-through when the file already has
+/// the sub-stream size.
+fn separate_sub_graph(vfilters: &[String], sub: &Stream, sub_overlay: Option<&str>) -> String {
+    let main_chain = if vfilters.is_empty() {
+        "null".to_string()
+    } else {
+        vfilters.join(",")
+    };
+    let overlay = sub_overlay
+        .map(|filter| format!(",{filter}"))
+        .unwrap_or_default();
+
+    format!(
+        "[0:v]{main_chain}[main];[1:v]scale={}:{},fps={}{overlay}[sub]",
+        sub.width, sub.height, sub.fps
+    )
+}
+
+/// Overlay font size for the sub stream: the main size scaled by the height ratio.
+fn scaled_font_size(font_size: u32, main: &Stream, sub: &Stream) -> u32 {
+    let scaled = u64::from(font_size) * u64::from(sub.height) / u64::from(main.height.max(1));
+    (scaled as u32).max(8)
+}
+
+/// Makes `sub_file` usable: creates it from the main video when it does not exist, then reads
+/// its size so the sub stream is announced with the real dimensions. On failure the camera
+/// falls back to scaling the main video at runtime.
+pub fn prepare_sub_file(config: &mut Config) {
+    let MediaInput::File(main) = config.media_input.clone() else {
+        return;
+    };
+    let Some(path) = config.sub.as_ref().and_then(|sub| sub.file.clone()) else {
+        return;
+    };
+    let Some(stream) = config.streams().get(1).cloned() else {
+        return;
+    };
+
+    if !path.exists() {
+        println!(
+            "sub file {} is missing; creating it from {} ({}x{}, {}k)",
+            path.display(),
+            main.display(),
+            stream.width,
+            stream.height,
+            stream.bitrate_kbps
+        );
+        if let Err(err) = create_sub_file(&config.ffmpeg_path, &main, &path, &stream) {
+            eprintln!(
+                "warning: could not create {}: {err}; scaling the main video instead",
+                path.display()
+            );
+            drop_sub_file(config);
+            return;
+        }
+    }
+
+    match probe_file(&config.ffmpeg_path, &path) {
+        Ok((width, height, _)) => {
+            if let Some(sub) = config.sub.as_mut() {
+                if sub.width.is_none() && sub.height.is_none() {
+                    sub.width = Some(width);
+                    sub.height = Some(height);
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!(
+                "warning: could not probe {}: {err}; scaling the main video instead",
+                path.display()
+            );
+            drop_sub_file(config);
+        }
+    }
+}
+
+fn drop_sub_file(config: &mut Config) {
+    if let Some(sub) = config.sub.as_mut() {
+        sub.file = None;
+    }
+}
+
+/// Encodes a small copy of `main` to `target` (written to a `.part` file first, so an
+/// interrupted run never leaves a truncated file behind).
+fn create_sub_file(
+    ffmpeg_path: &Path,
+    main: &Path,
+    target: &Path,
+    stream: &Stream,
+) -> Result<(), String> {
+    if let Some(dir) = target.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)
+            .map_err(|err| format!("cannot create {}: {err}", dir.display()))?;
+    }
+
+    let mut part_name = target.file_stem().unwrap_or_default().to_os_string();
+    part_name.push(".part");
+    if let Some(extension) = target.extension() {
+        part_name.push(".");
+        part_name.push(extension);
+    }
+    let part: PathBuf = target.with_file_name(part_name);
+
+    let bitrate = format!("{}k", stream.bitrate_kbps);
+    let status = Command::new(ffmpeg_path)
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i"])
+        .arg(main)
+        .arg("-vf")
+        .arg(format!(
+            "scale={}:{},fps={}",
+            stream.width, stream.height, stream.fps
+        ))
+        .args([
+            "-an", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+        ])
+        .args(["-b:v", &bitrate, "-maxrate", &bitrate, "-bufsize"])
+        .arg(format!("{}k", stream.bitrate_kbps.saturating_mul(2)))
+        .args(["-g", &stream.fps.to_string()])
+        .arg(&part)
+        .status()
+        .map_err(|err| format!("ffmpeg failed to run: {err}"))?;
+
+    if !status.success() {
+        let _ = std::fs::remove_file(&part);
+        return Err(format!("ffmpeg exited with {status}"));
+    }
+
+    std::fs::rename(&part, target).map_err(|err| format!("cannot rename {}: {err}", part.display()))
 }
 
 /// Local source ports for ffmpeg's RTP/RTCP sockets are taken from this range, below the
@@ -530,6 +680,34 @@ mod tests {
             graph,
             "[0:v]scale=1280:720,drawtext=x,split=2[main][subraw];[subraw]scale=426:240,fps=24[sub]"
         );
+    }
+
+    #[test]
+    fn separate_sub_input_is_not_split_or_scaled_from_main() {
+        let graph = separate_sub_graph(
+            &["scale=1280:720".to_string(), "drawtext=x".to_string()],
+            &sub_stream(),
+            Some("drawtext=small"),
+        );
+        assert_eq!(
+            graph,
+            "[0:v]scale=1280:720,drawtext=x[main];[1:v]scale=426:240,fps=24,drawtext=small[sub]"
+        );
+        assert_eq!(
+            separate_sub_graph(&[], &sub_stream(), None),
+            "[0:v]null[main];[1:v]scale=426:240,fps=24[sub]"
+        );
+    }
+
+    #[test]
+    fn sub_overlay_font_follows_the_height_ratio() {
+        let main = Stream {
+            height: 1080,
+            ..sub_stream()
+        };
+        let sub = sub_stream();
+        assert_eq!(scaled_font_size(32, &main, &sub), 8);
+        assert_eq!(scaled_font_size(96, &main, &sub), 21);
     }
 
     #[test]

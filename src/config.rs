@@ -73,6 +73,8 @@ pub struct SubStream {
     pub rtp_port: Option<u16>,
     pub codec: String,
     pub preset: Option<String>,
+    /// Prepared low-resolution video for this stream. Created from the main file when missing.
+    pub file: Option<PathBuf>,
 }
 
 /// Video format a stream is published in (RTP payload, SDP and ONVIF encoding).
@@ -123,6 +125,17 @@ impl Config {
             return None;
         }
         Some((self.username.as_deref()?, self.password.as_deref()?))
+    }
+
+    /// The prepared sub-stream file is derived from the main file, so it needs one.
+    fn validate_sub_file(&self) -> Result<(), String> {
+        let has_sub_file = self.sub.as_ref().is_some_and(|sub| sub.file.is_some());
+        if has_sub_file && !matches!(self.media_input, MediaInput::File(_)) {
+            return Err(
+                "sub_file requires file (a main video to derive the sub video from)".to_string(),
+            );
+        }
+        Ok(())
     }
 
     /// True when any stream of this camera is published as H.265.
@@ -228,6 +241,7 @@ struct SubOptions {
     rtp_port: Option<u16>,
     codec: Option<String>,
     preset: Option<String>,
+    file: Option<PathBuf>,
 }
 
 impl SubOptions {
@@ -239,7 +253,8 @@ impl SubOptions {
             || self.rtsp_path.is_some()
             || self.rtp_port.is_some()
             || self.codec.is_some()
-            || self.preset.is_some();
+            || self.preset.is_some()
+            || self.file.is_some();
         if !self.enabled {
             return if any_detail {
                 Err("sub_* options require sub_stream = true".to_string())
@@ -265,6 +280,7 @@ impl SubOptions {
             // per-GPU limit) for the main streams.
             codec: self.codec.unwrap_or_else(|| "libx264".to_string()),
             preset: self.preset,
+            file: self.file,
         }))
     }
 }
@@ -418,6 +434,11 @@ struct Cli {
     #[arg(long = "sub-rtp-port", value_parser = parse_rtp_port)]
     sub_rtp_port: Option<u16>,
 
+    /// Prepared low-resolution video for the sub stream, used instead of scaling the main video
+    /// at runtime. Created from the main file when it does not exist. Requires --file.
+    #[arg(long = "sub-file")]
+    sub_file: Option<PathBuf>,
+
     /// Sub-stream encoder. Defaults to libx264. HEVC encoders (libx265, hevc_nvenc, ...) publish
     /// the sub stream as H.265.
     #[arg(long = "sub-codec")]
@@ -486,6 +507,7 @@ struct TomlCamera {
     sub_rtp_port: Option<u16>,
     sub_codec: Option<String>,
     sub_preset: Option<String>,
+    sub_file: Option<PathBuf>,
     no_ffmpeg: Option<bool>,
     no_discovery: Option<bool>,
 }
@@ -555,6 +577,7 @@ impl TryFrom<Cli> for Config {
             rtp_port: cli.sub_rtp_port,
             codec: cli.sub_codec.clone(),
             preset: cli.sub_preset.clone(),
+            file: cli.sub_file.clone(),
         }
         .into_sub_stream()?;
 
@@ -568,7 +591,7 @@ impl TryFrom<Cli> for Config {
 
         validate_credentials(&cli.username, &cli.password)?;
 
-        Ok(Self {
+        let config = Self {
             camera_name: cli.camera_name,
             uuid: cli.uuid.unwrap_or_else(util::make_uuid),
             http_addr: cli.http_addr,
@@ -605,7 +628,9 @@ impl TryFrom<Cli> for Config {
             sub,
             no_ffmpeg: cli.no_ffmpeg,
             no_discovery: cli.no_discovery,
-        })
+        };
+        config.validate_sub_file()?;
+        Ok(config)
     }
 }
 
@@ -696,7 +721,7 @@ fn camera_from_toml(
     validate_credentials(&username, &password)
         .map_err(|err| format!("camera {}: {err}", index + 1))?;
 
-    Ok(Config {
+    let config = Config {
         camera_name: name,
         uuid,
         http_addr,
@@ -747,12 +772,18 @@ fn camera_from_toml(
             rtp_port: camera.sub_rtp_port.or(defaults.sub_rtp_port),
             codec: choose_optional_string(&camera.sub_codec, &defaults.sub_codec),
             preset: choose_optional_string(&camera.sub_preset, &defaults.sub_preset),
+            file: choose_optional_path(&camera.sub_file, &defaults.sub_file)
+                .map(|path| resolve_config_path(base_dir, path)),
         }
         .into_sub_stream()
         .map_err(|err| format!("camera {}: {err}", index + 1))?,
         no_ffmpeg: choose_copy(&camera.no_ffmpeg, &defaults.no_ffmpeg, false),
         no_discovery: choose_copy(&camera.no_discovery, &defaults.no_discovery, false),
-    })
+    };
+    config
+        .validate_sub_file()
+        .map_err(|err| format!("camera {}: {err}", index + 1))?;
+    Ok(config)
 }
 
 impl Default for Config {
@@ -1101,5 +1132,28 @@ mod tests {
         let mut same_path = a;
         same_path.sub.as_mut().unwrap().rtsp_path = "live".to_string();
         assert!(validate_fleet(&[same_path]).is_err());
+    }
+
+    #[test]
+    fn sub_file_needs_sub_stream_and_a_main_file() {
+        let toml = |body: &str| {
+            let config: TomlConfig = toml::from_str(body).unwrap();
+            camera_from_toml(&config.defaults, &config.cameras[0], 0, Path::new("/cfg"))
+        };
+
+        let ok =
+            toml("[[cameras]]\nfile = \"main.mp4\"\nsub_stream = true\nsub_file = \"sub.mkv\"\n")
+                .unwrap();
+        assert_eq!(
+            ok.sub.unwrap().file,
+            Some(PathBuf::from("/cfg/sub.mkv")),
+            "relative to the config file"
+        );
+
+        let no_sub = toml("[[cameras]]\nfile = \"main.mp4\"\nsub_file = \"sub.mkv\"\n");
+        assert!(no_sub.unwrap_err().contains("sub_stream"));
+
+        let no_main = toml("[[cameras]]\nsub_stream = true\nsub_file = \"sub.mkv\"\n");
+        assert!(no_main.unwrap_err().contains("requires file"));
     }
 }

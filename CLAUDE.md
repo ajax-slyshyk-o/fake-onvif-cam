@@ -92,6 +92,7 @@ http = "0.0.0.0:8000"
 rtsp_port = 8554
 rtp_port = 5004   # RTCP uses rtp_port+1 automatically
 sub_stream = true # optional 2nd stream: /live_sub, 240p, 512k, RTP port rtp_port+1000 (see README)
+sub_file = "sub.mkv" # optional prepared low-res video for the sub stream (created from `file` if missing)
 
 [[cameras]]
 name = "Fake Camera 02"

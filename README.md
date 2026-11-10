@@ -83,6 +83,22 @@ The camera then advertises two ONVIF profiles (`profile_1` main, `profile_2` sub
 | `--sub-rtsp-path` | `sub_rtsp_path` | `live_sub` |
 | `--sub-rtp-port` | `sub_rtp_port` | `rtp_port + 1000` (RTCP is the next port) |
 | `--sub-codec`, `--sub-preset` | `sub_codec`, `sub_preset` | `libx264`, codec default (`libx265` publishes H.265, see below) |
+| `--sub-file` | `sub_file` | none: the sub stream is scaled down from the main video at runtime (see below) |
+
+### Prepared sub video (`sub_file`)
+
+By default the sub stream is the main video scaled down while streaming. With `sub_file` the sub stream is fed from a second, already small video instead, so nothing is scaled at runtime:
+
+```toml
+file = "kyiv1080.mp4"
+sub_stream = true
+sub_file = "kyiv-sub.mkv"   # relative paths are relative to the config file
+```
+
+- If the file does not exist it is created once at startup from the main video (scaled to the sub size, H.264, at the sub bitrate, no audio) and reused afterwards. Cameras that share one `sub_file` create it only once. If creating fails the camera falls back to runtime scaling.
+- If it exists (for example a prepared 240p clip) its size is used for the sub stream unless `sub_width` / `sub_height` are set. Other sizes are scaled to the configured sub size.
+- It needs `file`, and, like the other `sub_*` options, `sub_stream = true`. The overlay text is drawn on the sub video too, with the font scaled to the sub height.
+- It is decoded in addition to the main video (a small extra decode); on 1080p30 it saved about 10% of ffmpeg's CPU time compared with scaling. The main decode and encode dominate the cost either way.
 
 The sub stream uses software `libx264` by default even when the main stream uses a hardware encoder, so a camera does not take a second NVENC session (consumer GPUs limit concurrent sessions). `sub_*` options without `sub_stream = true` are rejected. Sub-stream UDP ports take part in the fleet port-collision check.
 

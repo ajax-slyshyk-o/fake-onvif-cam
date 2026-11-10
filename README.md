@@ -223,6 +223,39 @@ overlay_text = "Fake Camera {n:02}"
 
 `configs/cameras-16-hw-sub-groups.toml` is `cameras-16-hw-sub.toml` written as two groups; the cameras are the same except for the uuids.
 
+### Shared source and cache (`share_source`, `cache`)
+
+Two options cut the CPU load of many cameras that play the same video. They work separately and together.
+
+**`share_source = true`** (`--share-source`): cameras with the same video settings (file, size, fps, bitrate, codec, preset, sub stream, audio) are served by one ffmpeg process: the video is decoded and encoded once and the RTP stream is relayed to the RTSP clients of all of them. Each camera keeps its own ONVIF identity, ports and RTSP paths. Startup prints `shared source: N cameras use one ffmpeg process`.
+
+- The overlay text of the first camera of the group is burned in for all of them. Cameras that differ in `overlay_text` still share, and startup says how many have a different text. Use one text for all (or `no_overlay`) when that matters.
+- The streams of a group are identical, with the same RTP SSRC. Only the first camera's `rtp_port` (and sub/audio ports) are used; the ports of the others stay unused but must still be unique.
+- Cameras that differ in any video setting form a separate group. One ffmpeg process serves a whole group, so if it dies they all restart together.
+
+**`cache = true`** (`--cache`, `--cache-dir DIR`, `--cache-clean[=BOOL]`): at startup the whole `file` is encoded once with the camera's settings (including overlay, sub stream and the audio of the file) into one MP4 file per stream. A running camera then only stream-copies those files to RTP: no decode and no encode, so it needs almost no CPU. Needs `file`; a test pattern ignores it.
+
+- The default directory is `fake-onvif-cam-cache` in the system temp dir; `cache_dir` is relative to the config file. Files are named `<video>-<hash>-main.mp4` / `-sub.mp4`. The hash covers every encoding setting and the size and modification time of the video, so changing a setting or the video creates a new file and an unchanged setup reuses an existing one.
+- **`cache_clean`** (`--cache-clean`, default `true`) deletes this run's cache files when the app exits normally (Ctrl+C, SIGTERM/SIGHUP, or a Windows close event), after ffmpeg has stopped. Every start then encodes again. Set `cache_clean = false` (`--cache-clean=false`) to keep the files and reuse them on the next start; they are then never deleted automatically. After `kill -9` or `taskkill /F` the files stay.
+- A start that has to create the cache takes as long as encoding the whole video (faster than real time, but several seconds to minutes). Starts that find the files (`cache_clean = false`) are immediate.
+- The overlay is part of the cache, so the same rule as above applies: one text per group.
+- At the point where the video loops, the picture restarts with a keyframe a few frames early and one RTP timestamp steps by a few milliseconds. ffmpeg logs `Non-monotonic DTS` warnings there.
+
+```toml
+[defaults]
+file = "kyiv.mp4"
+share_source = true
+cache = true
+cache_dir = "cache"        # optional
+cache_clean = false        # keep the files for the next start (default: delete on exit)
+
+[[cameras]]
+count = 16
+name = "Fake Camera {n:02}"
+overlay_text = "Fake Camera"   # same text for the whole group
+# ...
+```
+
 ### CPU load with many cameras
 
 Every camera runs its own ffmpeg encode, so the load grows linearly with the camera count. Sixteen 1080p30 `libx264 veryfast` streams can saturate a desktop CPU, and 4K is about four times heavier per stream. To reduce it, lower the resolution and fps (with `scale = true`), use `preset = "ultrafast"`, or move cameras to a hardware encoder. `codec` and `preset` can be set per camera, so encoders can be mixed.
@@ -262,6 +295,10 @@ Ready-made examples in the repository (`configs/`):
 --overlay-font <path>     Font file used for the overlay. Default: a platform system font.
 --overlay-font-size <px>  Overlay font size. Default: 32
 --no-overlay              Disable video text overlay.
+--share-source            Cameras with the same video settings share one ffmpeg process (see Shared source and cache).
+--cache                   Encode --file once into cache files and stream-copy them.
+--cache-dir <dir>         Directory of the cache files. Default: fake-onvif-cam-cache in the temp dir.
+--cache-clean[=BOOL]      Delete the cache files on exit. Default: true.
 --no-ffmpeg               Start only ONVIF services and do not launch ffmpeg.
 --no-discovery            Disable WS-Discovery listener.
 --export-cameras <path>   Write the configured cameras as JSON ("-" for stdout) and exit.

@@ -47,7 +47,7 @@ main thread
     │   └── per client thread
     ├── RTP relay       — per stream (and per audio track, port +2000); receives UDP from ffmpeg (:5004), broadcasts to RTSP clients
     ├── RTCP relay      — per stream/track; same for RTCP (:5005)
-    └── ffmpeg process  — one per camera; encodes main (+ optional sub) → RTP, supervised with auto-restart
+    └── ffmpeg process  — one per camera (one per group of cameras with `share_source`); encodes main (+ optional sub) → RTP, supervised with auto-restart
 ```
 
 With `sub_stream = true` a camera has two streams (`Config::streams()`: main first, then sub). Each stream has its own RTSP path, RTP/RTCP port pair, relay threads and client list; the RTSP accept loop routes DESCRIBE/SETUP by URL path, and `onvif.rs` emits one profile per stream (`profile_1`, `profile_2`).
@@ -62,6 +62,8 @@ With `sub_stream = true` a camera has two streams (`Config::streams()`: main fir
 | `http.rs` | Minimal HTTP server: routes `/`, `/snapshot.jpg` and the ONVIF service paths (`onvif::Service::path`) |
 | `rtsp.rs` | Custom RTSP server + RTP/RTCP relay; supports both TCP-interleaved and UDP-unicast transport |
 | `ffmpeg.rs` | Spawns/supervises ffmpeg subprocess; builds drawtext filter for overlay; handles platform fonts |
+| `source.rs` | `share_source`: groups cameras with identical video settings so one ffmpeg process (the first camera's, the leader) feeds all of them |
+| `cache.rs` | `cache`: encodes `file` once into MP4 files (one per stream, named by a hash of the settings); `ffmpeg.rs` then stream-copies them (`spawn_cached`); `cache::Cleanup` deletes them on exit unless `cache_clean = false` |
 | `export.rs` | `--export-cameras`: writes the resolved camera list as JSON and exits |
 | `auth.rs` | Optional login check: WS-Security UsernameToken, HTTP Digest (SOAP) and RTSP Digest |
 | `util.rs` | UUID v4 generation, XML/JSON escaping, UTC timestamp helpers |

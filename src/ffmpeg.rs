@@ -185,6 +185,10 @@ fn supervise(config: Config, mut child: Child, stop: Arc<AtomicBool>) {
 }
 
 fn spawn_child(config: &Config) -> io::Result<Child> {
+    if !config.cache_files.is_empty() {
+        return spawn_cached(config);
+    }
+
     let mut command = Command::new(&config.ffmpeg_path);
     command
         .arg("-hide_banner")
@@ -243,6 +247,37 @@ fn spawn_child(config: &Config) -> io::Result<Child> {
         }
     }
 
+    add_video_outputs(&mut command, config, |command, stream, index| {
+        add_output(command, stream, index as u32 + 1);
+    })?;
+
+    // One RTP output per audio track, each on its own port pair.
+    for (index, stream) in streams.iter().enumerate() {
+        if let Some(audio) = &stream.audio {
+            add_audio_output(&mut command, audio_input, audio, 11 + index as u32);
+        }
+    }
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+
+    command.spawn()
+}
+
+/// Video filters, `-map`s and one output per stream. `output` adds the options and the
+/// destination that follow each `-map` (it gets the stream and its index).
+///
+/// One process and one decode for all streams: the (overlaid) video is split and the sub stream
+/// is scaled down from the copy, or fed from the prepared `sub_file` (second input).
+pub(crate) fn add_video_outputs(
+    command: &mut Command,
+    config: &Config,
+    mut output: impl FnMut(&mut Command, &Stream, usize),
+) -> io::Result<()> {
+    let streams = config.streams();
+    let sub_file = config.sub.as_ref().and_then(|sub| sub.file.as_ref());
     let mut vfilters: Vec<String> = Vec::new();
 
     if config.scale && matches!(config.media_input, MediaInput::File(_)) {
@@ -258,15 +293,13 @@ fn spawn_child(config: &Config) -> io::Result<Child> {
         ));
     }
 
-    // One process and one decode for all streams: the (overlaid) video is split and the
-    // sub stream is scaled down from the copy.
     match streams.as_slice() {
         [main] => {
             command.arg("-map").arg("0:v:0");
             if !vfilters.is_empty() {
                 command.arg("-vf").arg(vfilters.join(","));
             }
-            add_output(&mut command, main, 1);
+            output(command, main, 0);
         }
         [main, sub] => {
             let graph = if sub_file.is_some() {
@@ -280,14 +313,43 @@ fn spawn_child(config: &Config) -> io::Result<Child> {
             };
             command.arg("-filter_complex").arg(graph);
             command.arg("-map").arg("[main]");
-            add_output(&mut command, main, 1);
+            output(command, main, 0);
             command.arg("-map").arg("[sub]");
-            add_output(&mut command, sub, 2);
+            output(command, sub, 1);
         }
         _ => return Err(io::Error::other("unsupported number of streams")),
     }
 
-    // One RTP output per audio track, each on its own port pair.
+    Ok(())
+}
+
+/// Command that stream-copies the cached videos (one file per stream, see `cache.rs`) to RTP:
+/// no decode and no encode. The main file also carries the audio of the source, if any.
+fn spawn_cached(config: &Config) -> io::Result<Child> {
+    let mut command = Command::new(&config.ffmpeg_path);
+    command.args(["-hide_banner", "-loglevel", "warning", "-nostdin"]);
+
+    for file in &config.cache_files {
+        command.args(["-re", "-stream_loop", "-1", "-i"]).arg(file);
+    }
+
+    // Audio comes from the cached main file when the source had some, otherwise silence.
+    let mut audio_input = 0;
+    if let Some(audio) = config.audio {
+        if !config.audio_from_file {
+            audio_input = config.cache_files.len();
+            command
+                .args(["-re", "-f", "lavfi", "-i"])
+                .arg(format!("anullsrc=r={}:cl=mono", audio.sample_rate()));
+        }
+    }
+
+    let streams = config.streams();
+    for (index, stream) in streams.iter().enumerate() {
+        command.arg("-map").arg(format!("{index}:v:0"));
+        add_copy_output(&mut command, stream, index as u32 + 1);
+    }
+
     for (index, stream) in streams.iter().enumerate() {
         if let Some(audio) = &stream.audio {
             add_audio_output(&mut command, audio_input, audio, 11 + index as u32);
@@ -531,23 +593,27 @@ fn free_local_port_pair() -> Option<u16> {
     None
 }
 
-/// Output options for one stream: encoder, rate control and the RTP destination.
-fn add_output(command: &mut Command, stream: &Stream, ssrc: u32) {
-    // Without explicit local ports ffmpeg binds an ephemeral RTP port and then RTCP at +1
-    // blindly, which fails with "bind failed" (WSAEADDRINUSE on Windows) when many ffmpeg
-    // processes start at once.
+/// Local RTP/RTCP source ports and the destination URL of a stream's RTP output.
+///
+/// Without explicit local ports ffmpeg binds an ephemeral RTP port and then RTCP at +1
+/// blindly, which fails with "bind failed" (WSAEADDRINUSE on Windows) when many ffmpeg
+/// processes start at once.
+fn rtp_url(stream: &Stream) -> String {
     let local = free_local_port_pair()
         .map(|port| format!("&localport={}&localrtcpport={}", port, port + 1))
         .unwrap_or_default();
-    let rtp_url = format!(
+    format!(
         "rtp://127.0.0.1:{}?rtcpport={}&pkt_size=1200{local}",
         stream.rtp_port,
         stream.rtp_port + 1
-    );
+    )
+}
+
+/// Encoder and rate control of one video stream.
+pub(crate) fn add_video_encode(command: &mut Command, stream: &Stream) {
     let bitrate = format!("{}k", stream.bitrate_kbps);
     let bufsize = format!("{}k", stream.bitrate_kbps.saturating_mul(2));
 
-    command.arg("-an");
     add_encoder_args(command, &stream.codec, stream.preset.as_deref());
     command
         .arg("-bf")
@@ -559,14 +625,32 @@ fn add_output(command: &mut Command, stream: &Stream, ssrc: u32) {
         .arg("-bufsize")
         .arg(&bufsize)
         .arg("-g")
-        .arg(stream.fps.to_string())
+        .arg(stream.fps.to_string());
+}
+
+/// Output options for one stream: encoder, rate control and the RTP destination.
+fn add_output(command: &mut Command, stream: &Stream, ssrc: u32) {
+    command.arg("-an");
+    add_video_encode(command, stream);
+    command
         .arg("-f")
         .arg("rtp")
         .arg("-payload_type")
         .arg("96")
         .arg("-ssrc")
         .arg(ssrc.to_string())
-        .arg(rtp_url);
+        .arg(rtp_url(stream));
+}
+
+/// RTP output of an already encoded stream (from the cache): copied. The RTP muxer converts
+/// MP4-style packets and puts the parameter sets in front of every keyframe, which the SDP
+/// (without sprop-parameter-sets) relies on.
+fn add_copy_output(command: &mut Command, stream: &Stream, ssrc: u32) {
+    command
+        .args(["-an", "-c:v", "copy"])
+        .args(["-f", "rtp", "-payload_type", "96", "-ssrc"])
+        .arg(ssrc.to_string())
+        .arg(rtp_url(stream));
 }
 
 /// Encoder-specific arguments. The RTSP SDP carries no sprop-parameter-sets, so every

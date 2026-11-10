@@ -59,6 +59,7 @@ struct TcpPacket {
 
 /// One RTP/RTCP track of a stream (video or audio): its ingest sockets, fed by ffmpeg, and the
 /// RTSP clients subscribed to it.
+#[derive(Clone)]
 struct TrackRelay {
     clients: Clients,
     rtp_socket: Arc<UdpSocket>,
@@ -93,13 +94,32 @@ impl RtspRequest {
     }
 }
 
-pub fn spawn(config: Arc<Config>) -> io::Result<RtspServerGuard> {
-    let listener = TcpListener::bind(("0.0.0.0", config.rtsp_port))?;
-    listener.set_nonblocking(true)?;
+/// The ingest side of one ffmpeg process: the UDP sockets it publishes RTP/RTCP to, the relay
+/// threads reading them and the subscribed RTSP clients of every track. Cameras that share one
+/// ffmpeg process share one `Source`, so a client of any of them gets the same packets.
+pub struct Source {
+    stop: Arc<AtomicBool>,
+    workers: Vec<JoinHandle<()>>,
+    /// One entry per stream (main, then sub): the video track and the optional audio track.
+    tracks: Vec<(TrackRelay, Option<TrackRelay>)>,
+}
 
+impl Drop for Source {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Binds the ingest ports of `config`'s streams (the RTP ports ffmpeg sends to) and starts
+/// relaying them.
+pub fn spawn_source(config: &Config) -> io::Result<Source> {
     let stop = Arc::new(AtomicBool::new(false));
-    let mut relays = Vec::new();
     let mut workers = Vec::new();
+    let mut tracks = Vec::new();
 
     for stream in config.streams() {
         let video = spawn_track(stream.name, stream.rtp_port, &stop, &mut workers)?;
@@ -114,19 +134,51 @@ pub fn spawn(config: Arc<Config>) -> io::Result<RtspServerGuard> {
                 )
             })
             .transpose()?;
-        relays.push(Arc::new(StreamRelay {
-            stream,
-            video,
-            audio,
-        }));
+        tracks.push((video, audio));
     }
 
-    workers.push(spawn_accept_loop(
+    Ok(Source {
+        stop,
+        workers,
+        tracks,
+    })
+}
+
+/// Starts the RTSP server of one camera. Its streams are fed by `source`, which must have the
+/// same stream layout (one video track per stream, audio where the stream has audio).
+pub fn spawn(config: Arc<Config>, source: &Source) -> io::Result<RtspServerGuard> {
+    let streams = config.streams();
+    if streams.len() != source.tracks.len() {
+        return Err(io::Error::other(format!(
+            "camera {} has {} streams but its ffmpeg source has {}",
+            config.camera_name,
+            streams.len(),
+            source.tracks.len()
+        )));
+    }
+
+    let listener = TcpListener::bind(("0.0.0.0", config.rtsp_port))?;
+    listener.set_nonblocking(true)?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let relays: Vec<_> = streams
+        .into_iter()
+        .zip(&source.tracks)
+        .map(|(stream, (video, audio))| {
+            Arc::new(StreamRelay {
+                audio: audio.clone().filter(|_| stream.audio.is_some()),
+                video: video.clone(),
+                stream,
+            })
+        })
+        .collect();
+
+    let workers = vec![spawn_accept_loop(
         listener,
         config,
         Arc::new(relays),
         stop.clone(),
-    )?);
+    )?];
 
     Ok(RtspServerGuard { stop, workers })
 }

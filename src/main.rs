@@ -1,4 +1,5 @@
 mod auth;
+mod cache;
 mod config;
 mod discovery;
 mod export;
@@ -6,6 +7,7 @@ mod ffmpeg;
 mod http;
 mod onvif;
 mod rtsp;
+mod source;
 mod util;
 
 use std::process;
@@ -42,7 +44,7 @@ fn main() -> process::ExitCode {
 
     let configs = startup.configs;
 
-    let configs: Vec<_> = configs
+    let mut configs: Vec<_> = configs
         .into_iter()
         .map(|mut cfg| {
             if let config::MediaInput::File(ref path) = cfg.media_input.clone() {
@@ -68,9 +70,37 @@ fn main() -> process::ExitCode {
             {
                 cfg.audio_from_file = ffmpeg::has_audio(&cfg.ffmpeg_path, path);
             }
-            Arc::new(cfg)
+            cfg
         })
         .collect();
+
+    // Cameras that share a source are served by one ffmpeg process, run with the leader's
+    // config; only the leader needs the cache.
+    let groups = source::group_cameras(&configs);
+    for group in &groups {
+        let leader = group[0];
+        cache::prepare(&mut configs[leader]);
+
+        if group.len() > 1 {
+            let leader_text = configs[leader].overlay_text.clone();
+            let differing = group
+                .iter()
+                .filter(|&&index| configs[index].overlay_text != leader_text)
+                .count();
+            println!(
+                "shared source: {} cameras use one ffmpeg process, fed by {}",
+                group.len(),
+                configs[leader].camera_name
+            );
+            if differing > 0 {
+                println!(
+                    "shared source: {differing} of them have a different overlay_text; all show \"{}\"",
+                    leader_text.as_deref().unwrap_or("")
+                );
+            }
+        }
+    }
+    let configs: Vec<Arc<config::Config>> = configs.into_iter().map(Arc::new).collect();
 
     println!("fake-onvif-cam {}", config::app_version());
     println!("cameras: {}", configs.len());
@@ -97,84 +127,106 @@ fn main() -> process::ExitCode {
         return process::ExitCode::FAILURE;
     }
 
+    // Declared before the ffmpeg guards, so it is dropped after ffmpeg has stopped.
+    let _cache_cleanup = cache::Cleanup::new(groups.iter().map(|group| &*configs[group[0]]));
+
     let mut rtsp_servers = Vec::new();
     let mut ffmpeg_processes = Vec::new();
+    let mut sources = Vec::new();
     let mut http_threads = Vec::new();
 
-    for config in &configs {
-        println!();
-        println!("camera: {}", config.camera_name);
-        println!("uuid: {}", config.uuid);
-        println!("device service: {}", onvif::device_xaddr(config));
-        println!("media service: {}", onvif::media_xaddr(config));
-        if let Some(xaddr) = onvif::media2_xaddr(config) {
-            println!("media2 service: {xaddr}");
-        }
-        for stream in config.streams() {
-            println!(
-                "rtsp {} stream: {}  ({}x{} @ {}fps, {}k {})",
-                stream.name,
-                onvif::rtsp_uri(config, &stream),
-                stream.width,
-                stream.height,
-                stream.fps,
-                stream.bitrate_kbps,
-                stream.codec
-            );
-        }
-        match &config.media_input {
-            config::MediaInput::File(path) => println!(
-                "source: file {}{}",
-                path.display(),
-                if config.scale { "  (scaled)" } else { "" }
-            ),
-            config::MediaInput::TestPattern => println!("source: test pattern"),
-        }
+    for group in &groups {
+        let leader = &configs[group[0]];
 
-        match rtsp::spawn(config.clone()) {
-            Ok(server) => {
-                println!("rtsp: listening on rtsp://0.0.0.0:{}", config.rtsp_port);
-                rtsp_servers.push(server);
-            }
+        // The relay that ffmpeg's RTP for this group arrives at, shared by its cameras.
+        let source = match rtsp::spawn_source(leader) {
+            Ok(source) => source,
             Err(err) => {
                 eprintln!(
-                    "failed to start rtsp service for {}: {err}",
-                    config.camera_name
+                    "failed to bind the rtp ports of {}: {err}",
+                    leader.camera_name
                 );
                 return process::ExitCode::FAILURE;
             }
+        };
+
+        for &index in group {
+            let config = &configs[index];
+            println!();
+            println!("camera: {}", config.camera_name);
+            println!("uuid: {}", config.uuid);
+            println!("device service: {}", onvif::device_xaddr(config));
+            println!("media service: {}", onvif::media_xaddr(config));
+            if let Some(xaddr) = onvif::media2_xaddr(config) {
+                println!("media2 service: {xaddr}");
+            }
+            for stream in config.streams() {
+                println!(
+                    "rtsp {} stream: {}  ({}x{} @ {}fps, {}k {})",
+                    stream.name,
+                    onvif::rtsp_uri(config, &stream),
+                    stream.width,
+                    stream.height,
+                    stream.fps,
+                    stream.bitrate_kbps,
+                    stream.codec
+                );
+            }
+            match &config.media_input {
+                config::MediaInput::File(path) => println!(
+                    "source: file {}{}",
+                    path.display(),
+                    if config.scale { "  (scaled)" } else { "" }
+                ),
+                config::MediaInput::TestPattern => println!("source: test pattern"),
+            }
+
+            match rtsp::spawn(config.clone(), &source) {
+                Ok(server) => {
+                    println!("rtsp: listening on rtsp://0.0.0.0:{}", config.rtsp_port);
+                    rtsp_servers.push(server);
+                }
+                Err(err) => {
+                    eprintln!(
+                        "failed to start rtsp service for {}: {err}",
+                        config.camera_name
+                    );
+                    return process::ExitCode::FAILURE;
+                }
+            }
+
+            let http_config = config.clone();
+            let camera_name = config.camera_name.clone();
+            let event_tx = event_tx.clone();
+            match thread::Builder::new()
+                .name(format!("onvif-http-{}", camera_name))
+                .spawn(move || {
+                    if let Err(err) = http::serve(http_config) {
+                        let _ = event_tx.send(RuntimeEvent::Fatal(format!(
+                            "http service for {camera_name} failed: {err}"
+                        )));
+                    }
+                }) {
+                Ok(thread) => http_threads.push(thread),
+                Err(err) => {
+                    eprintln!(
+                        "failed to start http service for {}: {err}",
+                        config.camera_name
+                    );
+                    return process::ExitCode::FAILURE;
+                }
+            }
         }
 
-        match ffmpeg::start(config) {
+        match ffmpeg::start(leader) {
             Ok(child) => ffmpeg_processes.push(child),
             Err(err) => {
-                eprintln!("failed to start ffmpeg for {}: {err}", config.camera_name);
+                eprintln!("failed to start ffmpeg for {}: {err}", leader.camera_name);
                 eprintln!("start with --no-ffmpeg if you only want the ONVIF endpoints");
                 return process::ExitCode::FAILURE;
             }
         }
-
-        let http_config = config.clone();
-        let camera_name = config.camera_name.clone();
-        let event_tx = event_tx.clone();
-        match thread::Builder::new()
-            .name(format!("onvif-http-{}", camera_name))
-            .spawn(move || {
-                if let Err(err) = http::serve(http_config) {
-                    let _ = event_tx.send(RuntimeEvent::Fatal(format!(
-                        "http service for {camera_name} failed: {err}"
-                    )));
-                }
-            }) {
-            Ok(thread) => http_threads.push(thread),
-            Err(err) => {
-                eprintln!(
-                    "failed to start http service for {}: {err}",
-                    config.camera_name
-                );
-                return process::ExitCode::FAILURE;
-            }
-        }
+        sources.push(source);
     }
 
     drop(event_tx);

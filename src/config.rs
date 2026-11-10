@@ -64,6 +64,18 @@ pub struct Config {
     pub overlay_font_size: u32,
     pub scale: bool,
     pub sub: Option<SubStream>,
+    /// Cameras with the same video settings share one ffmpeg process (one decode, one encode)
+    /// and its RTP stream. The overlay text of the first of them is used for all.
+    pub share_source: bool,
+    /// Encode the video once into a cache file and stream-copy it afterwards (file input only).
+    pub cache: bool,
+    /// Directory of the cache files. `None`: `fake-onvif-cam-cache` in the system temp dir.
+    pub cache_dir: Option<PathBuf>,
+    /// Delete the cache files when the app exits.
+    pub cache_clean: bool,
+    /// Cached encoded video of each stream (main, then sub), set at startup once the cache
+    /// exists. Empty: encode live.
+    pub cache_files: Vec<PathBuf>,
     pub no_ffmpeg: bool,
     pub no_discovery: bool,
 }
@@ -610,6 +622,32 @@ struct Cli {
     #[arg(long = "sub-preset")]
     sub_preset: Option<String>,
 
+    /// Let cameras with the same video settings share one ffmpeg process: the video is decoded
+    /// and encoded once and every camera relays the same stream. They all show the overlay
+    /// text of the first one.
+    #[arg(long = "share-source")]
+    share_source: bool,
+
+    /// Encode --file once into a cache file and stream-copy that afterwards, so a running
+    /// camera needs almost no CPU. The cache is reused while the video and settings are unchanged.
+    #[arg(long = "cache")]
+    cache: bool,
+
+    /// Directory for --cache files. Defaults to `fake-onvif-cam-cache` in the system temp dir.
+    #[arg(long = "cache-dir", value_name = "DIR")]
+    cache_dir: Option<PathBuf>,
+
+    /// Delete the --cache files when the app exits (the default when not given).
+    /// `--cache-clean=false` keeps them, so the next start reuses them instead of encoding again.
+    #[arg(
+        long = "cache-clean",
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set
+    )]
+    cache_clean: Option<bool>,
+
     /// Do not launch ffmpeg.
     #[arg(long = "no-ffmpeg")]
     no_ffmpeg: bool,
@@ -675,6 +713,10 @@ struct TomlCamera {
     sub_codec: Option<String>,
     sub_preset: Option<String>,
     sub_file: Option<PathBuf>,
+    share_source: Option<bool>,
+    cache: Option<bool>,
+    cache_dir: Option<PathBuf>,
+    cache_clean: Option<bool>,
     no_ffmpeg: Option<bool>,
     no_discovery: Option<bool>,
 }
@@ -701,6 +743,7 @@ pub fn load_from_env() -> Result<Startup, String> {
 
     let configs = if let Some(path) = cli.config.as_deref() {
         let mut configs = load_from_toml(path)?;
+        apply_cache_overrides(&mut configs, &cli);
         if let Some(host) = &cli.advertise_host {
             for config in &mut configs {
                 config.advertise_host = host.clone();
@@ -727,6 +770,21 @@ pub fn load_from_env() -> Result<Startup, String> {
         configs,
         export_cameras,
     })
+}
+
+/// `--share-source`, `--cache`, `--cache-dir` and `--cache-clean` are run-wide switches: given
+/// on the command line they win over the config file for every camera.
+fn apply_cache_overrides(configs: &mut [Config], cli: &Cli) {
+    for config in configs {
+        config.share_source |= cli.share_source;
+        config.cache |= cli.cache;
+        if let Some(dir) = &cli.cache_dir {
+            config.cache_dir = Some(dir.clone());
+        }
+        if let Some(clean) = cli.cache_clean {
+            config.cache_clean = clean;
+        }
+    }
 }
 
 impl TryFrom<Cli> for Config {
@@ -801,6 +859,11 @@ impl TryFrom<Cli> for Config {
             overlay_font_size: cli.overlay_font_size,
             scale: cli.scale,
             sub,
+            share_source: cli.share_source,
+            cache: cli.cache,
+            cache_dir: cli.cache_dir,
+            cache_clean: cli.cache_clean.unwrap_or(true),
+            cache_files: Vec::new(),
             no_ffmpeg: cli.no_ffmpeg,
             no_discovery: cli.no_discovery,
         };
@@ -860,7 +923,10 @@ fn expand_cameras(
     for (group, camera) in cameras.iter().enumerate() {
         let count = camera.count.unwrap_or(1);
         if count == 0 {
-            return Err(format!("[[cameras]] entry {}: count must be at least 1", group + 1));
+            return Err(format!(
+                "[[cameras]] entry {}: count must be at least 1",
+                group + 1
+            ));
         }
         let grouped = count > 1;
 
@@ -996,7 +1062,11 @@ fn format_placeholder(inner: &str, n: usize, i: usize) -> Option<String> {
         None => (spec, false),
     };
     let zero = spec.starts_with('0');
-    let width: usize = if spec.is_empty() { 0 } else { spec.parse().ok()? };
+    let width: usize = if spec.is_empty() {
+        0
+    } else {
+        spec.parse().ok()?
+    };
 
     Some(match (hex, zero) {
         (true, true) => format!("{value:0width$x}"),
@@ -1141,6 +1211,12 @@ fn camera_from_toml(
         }
         .into_sub_stream()
         .map_err(|err| format!("camera {}: {err}", index + 1))?,
+        share_source: choose_copy(&camera.share_source, &defaults.share_source, false),
+        cache: choose_copy(&camera.cache, &defaults.cache, false),
+        cache_dir: choose_optional_path(&camera.cache_dir, &defaults.cache_dir)
+            .map(|path| resolve_config_path(base_dir, path)),
+        cache_clean: choose_copy(&camera.cache_clean, &defaults.cache_clean, true),
+        cache_files: Vec::new(),
         no_ffmpeg: choose_copy(&camera.no_ffmpeg, &defaults.no_ffmpeg, false),
         no_discovery: choose_copy(&camera.no_discovery, &defaults.no_discovery, false),
     };
@@ -1186,6 +1262,11 @@ impl Default for Config {
             overlay_font_size: 32,
             scale: false,
             sub: None,
+            share_source: false,
+            cache: false,
+            cache_dir: None,
+            cache_clean: true,
+            cache_files: Vec::new(),
             no_ffmpeg: false,
             no_discovery: false,
         }
@@ -1645,8 +1726,14 @@ mod tests {
     fn templates_support_padding_and_hex() {
         assert_eq!(expand_template("Cam {n} / {i}", 3, 1), "Cam 3 / 1");
         assert_eq!(expand_template("{n:02}-{n:03}", 7, 1), "07-007");
-        assert_eq!(expand_template("{n:x} {n:04x} {n:4}", 255, 1), "ff 00ff  255");
-        assert_eq!(expand_template("{x} {n:q} { {n} {n", 1, 1), "{x} {n:q} { 1 {n");
+        assert_eq!(
+            expand_template("{n:x} {n:04x} {n:4}", 255, 1),
+            "ff 00ff  255"
+        );
+        assert_eq!(
+            expand_template("{x} {n:q} { {n} {n", 1, 1),
+            "{x} {n:q} { 1 {n"
+        );
         assert!(has_placeholder("a{i}"));
         assert!(!has_placeholder("a-b"));
     }
@@ -1696,7 +1783,10 @@ mod tests {
             Some("00000000-0000-4550-98a8-98a80cab0002")
         );
         assert_eq!(cameras[2].serial.as_deref(), Some("FAKE-ONVIF-003"));
-        assert_eq!(cameras[0].uuid, None, "a single camera keeps the generated uuid");
+        assert_eq!(
+            cameras[0].uuid, None,
+            "a single camera keeps the generated uuid"
+        );
     }
 
     #[test]
@@ -1718,5 +1808,66 @@ mod tests {
         .unwrap();
         assert_eq!(cameras[1].overlay_text.as_deref(), Some("cam 2"));
         assert_eq!(cameras[1].serial.as_deref(), Some("SN2"));
+    }
+
+    #[test]
+    fn share_source_and_cache_options_in_toml() {
+        let load = |body: &str| {
+            let config: TomlConfig = toml::from_str(body).unwrap();
+            camera_from_toml(&config.defaults, &config.cameras[0], 0, Path::new("/cfg")).unwrap()
+        };
+
+        let off = load("[[cameras]]\n");
+        assert!(!off.share_source && !off.cache && off.cache_dir.is_none());
+        assert!(off.cache_clean, "cleaned on exit unless told otherwise");
+        assert!(!load("[[cameras]]\ncache_clean = false\n").cache_clean);
+        assert!(off.cache_files.is_empty());
+
+        let on =
+            load("[defaults]\nshare_source = true\ncache = true\ncache_dir = \"c\"\n[[cameras]]\n");
+        assert!(on.share_source && on.cache);
+        assert_eq!(
+            on.cache_dir,
+            Some(PathBuf::from("/cfg/c")),
+            "relative to the config"
+        );
+
+        let overridden = load("[defaults]\ncache = true\n[[cameras]]\ncache = false\n");
+        assert!(!overridden.cache);
+    }
+
+    #[test]
+    fn cache_switches_on_the_command_line_win_over_the_config_file() {
+        let toml = |body: &str| {
+            let config: TomlConfig = toml::from_str(body).unwrap();
+            camera_from_toml(&config.defaults, &config.cameras[0], 0, Path::new("/cfg")).unwrap()
+        };
+        let cli =
+            |args: &[&str]| Cli::parse_from(std::iter::once("app").chain(args.iter().copied()));
+        let run = |args: &[&str], body: &str| {
+            let mut configs = vec![toml(body)];
+            apply_cache_overrides(&mut configs, &cli(args));
+            configs.remove(0)
+        };
+
+        let untouched = run(&[], "[defaults]\ncache_clean = false\n[[cameras]]\n");
+        assert!(!untouched.share_source && !untouched.cache && !untouched.cache_clean);
+
+        let forced = run(
+            &[
+                "--share-source",
+                "--cache",
+                "--cache-dir",
+                "d",
+                "--cache-clean",
+            ],
+            "[defaults]\ncache_clean = false\n[[cameras]]\n",
+        );
+        assert!(forced.share_source && forced.cache && forced.cache_clean);
+        assert_eq!(forced.cache_dir, Some(PathBuf::from("d")));
+
+        let keep = run(&["--cache-clean=false"], "[[cameras]]\n");
+        assert!(!keep.cache_clean);
+        assert!(cli(&[]).cache_clean.is_none());
     }
 }

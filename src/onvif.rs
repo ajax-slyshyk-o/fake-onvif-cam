@@ -91,6 +91,18 @@ pub fn detect_operation(xml: &str) -> Option<String> {
         "GetScopes",
         "GetHostname",
         "GetNetworkInterfaces",
+        "GetNetworkProtocols",
+        "GetNetworkDefaultGateway",
+        "GetDiscoveryMode",
+        "GetUsers",
+        "GetDNS",
+        "GetNTP",
+        "GetZeroConfiguration",
+        "GetRelayOutputs",
+        "GetWsdlUrl",
+        "GetDigitalInputs",
+        "GetIPAddressFilter",
+        "GetSystemUris",
         "GetProfiles",
         "GetProfile",
         "GetStreamUri",
@@ -177,6 +189,33 @@ pub fn soap_response_for_service(
         Some("GetScopes") => get_scopes(config),
         Some("GetHostname") => get_hostname(config),
         Some("GetNetworkInterfaces") => get_network_interfaces(config),
+        Some("GetNetworkProtocols") => get_network_protocols(config),
+        Some("GetNetworkDefaultGateway") => get_network_default_gateway(config),
+        Some("GetDiscoveryMode") => {
+            "<tds:GetDiscoveryModeResponse><tds:DiscoveryMode>Discoverable</tds:DiscoveryMode></tds:GetDiscoveryModeResponse>"
+                .to_string()
+        }
+        Some("GetUsers") => get_users(config),
+        Some("GetDNS") => {
+            "<tds:GetDNSResponse><tds:DNSInformation><tt:FromDHCP>true</tt:FromDHCP></tds:DNSInformation></tds:GetDNSResponse>"
+                .to_string()
+        }
+        Some("GetNTP") => {
+            "<tds:GetNTPResponse><tds:NTPInformation><tt:FromDHCP>false</tt:FromDHCP></tds:NTPInformation></tds:GetNTPResponse>"
+                .to_string()
+        }
+        Some("GetZeroConfiguration") => {
+            "<tds:GetZeroConfigurationResponse><tds:ZeroConfiguration/></tds:GetZeroConfigurationResponse>"
+                .to_string()
+        }
+        Some("GetRelayOutputs") => "<tds:GetRelayOutputsResponse/>".to_string(),
+        Some("GetWsdlUrl") => {
+            "<tds:GetWsdlUrlResponse><tds:WsdlUrl>https://www.onvif.org/ver10/device/wsdl/devicemgmt.wsdl</tds:WsdlUrl></tds:GetWsdlUrlResponse>"
+                .to_string()
+        }
+        Some("GetDigitalInputs") | Some("GetIPAddressFilter") | Some("GetSystemUris") => {
+            action_not_supported_fault()
+        }
         Some("GetProfiles") => get_profiles(config),
         Some("GetProfile") => requested_stream(config, request)
             .map(|(index, stream)| get_profile(config, index, &stream))
@@ -215,7 +254,8 @@ fn envelope(body: &str) -> String {
             xmlns:tds="http://www.onvif.org/ver10/device/wsdl"
             xmlns:trt="http://www.onvif.org/ver10/media/wsdl"
             xmlns:tr2="http://www.onvif.org/ver20/media/wsdl"
-            xmlns:tt="http://www.onvif.org/ver10/schema">
+            xmlns:tt="http://www.onvif.org/ver10/schema"
+            xmlns:ter="http://www.onvif.org/ver10/error">
   <s:Body>
     {body}
   </s:Body>
@@ -368,6 +408,57 @@ fn get_hostname(config: &Config) -> String {
   </tds:HostnameInformation>
 </tds:GetHostnameResponse>"#
     )
+}
+
+fn get_network_protocols(config: &Config) -> String {
+    format!(
+        r#"<tds:GetNetworkProtocolsResponse>
+  <tds:NetworkProtocols>
+    <tt:Name>HTTP</tt:Name>
+    <tt:Enabled>true</tt:Enabled>
+    <tt:Port>{}</tt:Port>
+  </tds:NetworkProtocols>
+  <tds:NetworkProtocols>
+    <tt:Name>RTSP</tt:Name>
+    <tt:Enabled>true</tt:Enabled>
+    <tt:Port>{}</tt:Port>
+  </tds:NetworkProtocols>
+</tds:GetNetworkProtocolsResponse>"#,
+        config.http_addr.port(),
+        config.rtsp_port
+    )
+}
+
+/// The `.1` host of the advertised IPv4 subnet, or `0.0.0.0` for anything else.
+fn get_network_default_gateway(config: &Config) -> String {
+    let gateway = config
+        .advertise_host
+        .parse::<std::net::Ipv4Addr>()
+        .map(|ip| {
+            let [a, b, c, _] = ip.octets();
+            std::net::Ipv4Addr::new(a, b, c, 1)
+        })
+        .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+
+    format!(
+        "<tds:GetNetworkDefaultGatewayResponse><tds:NetworkGateway><tt:IPv4Address>{gateway}</tt:IPv4Address></tds:NetworkGateway></tds:GetNetworkDefaultGatewayResponse>"
+    )
+}
+
+/// Lists the configured camera user (the credentials are not checked).
+fn get_users(config: &Config) -> String {
+    let user = config
+        .username
+        .as_deref()
+        .map(|username| {
+            format!(
+                "<tds:User><tt:Username>{}</tt:Username><tt:UserLevel>Administrator</tt:UserLevel></tds:User>",
+                util::xml_escape(username)
+            )
+        })
+        .unwrap_or_default();
+
+    format!("<tds:GetUsersResponse>{user}</tds:GetUsersResponse>")
 }
 
 fn get_network_interfaces(config: &Config) -> String {
@@ -637,6 +728,18 @@ fn get_media_service_capabilities() -> String {
         .to_string()
 }
 
+/// Fault real cameras return for operations they do not implement.
+fn action_not_supported_fault() -> String {
+    r#"<s:Fault>
+  <s:Code>
+    <s:Value>s:Receiver</s:Value>
+    <s:Subcode><s:Value>ter:ActionNotSupported</s:Value></s:Subcode>
+  </s:Code>
+  <s:Reason><s:Text xml:lang="en">Not supported</s:Text></s:Reason>
+</s:Fault>"#
+        .to_string()
+}
+
 fn soap_fault(reason: &str) -> String {
     let reason = util::xml_escape(reason);
 
@@ -840,6 +943,50 @@ mod tests {
         assert!(media.contains(r#"SnapshotUri="true""#));
         assert!(media.contains("MaximumNumberOfProfiles"));
         assert!(media.contains("<trt:StreamingCapabilities "));
+    }
+
+    fn device(op: &str, config: &Config) -> String {
+        let request = format!("<tds:{op}/>");
+        let operation = detect_operation(&request);
+        assert_eq!(operation.as_deref(), Some(op));
+        soap_response_for_service(Service::Device, operation.as_deref(), config, &request)
+    }
+
+    #[test]
+    fn device_network_operations() {
+        let mut config = two_stream_config();
+        config.advertise_host = "192.168.7.42".to_string();
+        config.http_addr = "0.0.0.0:8123".parse().unwrap();
+        config.rtsp_port = 8654;
+
+        let protocols = device("GetNetworkProtocols", &config);
+        assert!(protocols.contains("<tt:Port>8123</tt:Port>"));
+        assert!(protocols.contains("<tt:Port>8654</tt:Port>"));
+        assert!(device("GetNetworkDefaultGateway", &config).contains("192.168.7.1<"));
+        assert!(device("GetDiscoveryMode", &config).contains("Discoverable"));
+        assert!(device("GetDNS", &config).contains("<tt:FromDHCP>true"));
+        assert!(device("GetNTP", &config).contains("<tt:FromDHCP>false"));
+        assert!(device("GetZeroConfiguration", &config).contains("ZeroConfiguration"));
+        assert!(device("GetRelayOutputs", &config).contains("GetRelayOutputsResponse"));
+        assert!(device("GetWsdlUrl", &config).contains("devicemgmt.wsdl"));
+    }
+
+    #[test]
+    fn users_list_the_configured_user() {
+        let mut config = two_stream_config();
+        assert!(!device("GetUsers", &config).contains("<tds:User>"));
+        config.username = Some("ad<min".to_string());
+        let xml = device("GetUsers", &config);
+        assert!(xml.contains("<tt:Username>ad&lt;min</tt:Username>"));
+        assert!(xml.contains("Administrator"));
+    }
+
+    #[test]
+    fn unimplemented_device_operations_are_action_not_supported() {
+        let config = two_stream_config();
+        for op in ["GetDigitalInputs", "GetIPAddressFilter", "GetSystemUris"] {
+            assert!(device(op, &config).contains("ter:ActionNotSupported"), "{op}");
+        }
     }
 
     #[test]

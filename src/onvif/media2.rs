@@ -2,9 +2,9 @@
 //! H.265. Media1 reports an HEVC stream as H.264 Baseline (see `video_encoder_configuration_xml`).
 
 use super::{
-    bitrate_limit, profile_name, profile_token, request_value, requested_stream, rtsp_uri,
-    snapshot_uri, soap_fault, video_encoder_config_token, VIDEO_SOURCE_CONFIG_TOKEN,
-    VIDEO_SOURCE_TOKEN,
+    action_not_supported_fault, bitrate_limit, profile_name, profile_token, request_value,
+    requested_stream, rtsp_uri, snapshot_uri, soap_fault, video_encoder_config_token,
+    VIDEO_SOURCE_CONFIG_TOKEN, VIDEO_SOURCE_TOKEN,
 };
 use crate::config::{Config, Stream, VideoFormat};
 use crate::util;
@@ -20,6 +20,7 @@ pub fn soap_body(operation: Option<&str>, config: &Config, request: &str) -> Str
                 )
             })
             .unwrap_or_else(|reason| soap_fault(&reason)),
+        Some("GetSnapshotUri") if config.no_snapshot => action_not_supported_fault(),
         Some("GetSnapshotUri") => format!(
             "<tr2:GetSnapshotUriResponse>\n  <tr2:Uri>{}</tr2:Uri>\n</tr2:GetSnapshotUriResponse>",
             util::xml_escape(&snapshot_uri(config))
@@ -32,7 +33,7 @@ pub fn soap_body(operation: Option<&str>, config: &Config, request: &str) -> Str
         Some("GetVideoEncoderConfigurationOptions") => {
             get_video_encoder_configuration_options(config, request)
         }
-        Some("GetServiceCapabilities") => service_capabilities(),
+        Some("GetServiceCapabilities") => service_capabilities(config),
         Some("SetSynchronizationPoint") => "<tr2:SetSynchronizationPointResponse/>".to_string(),
         Some(other) => soap_fault(&format!("Unsupported Media2 operation: {other}")),
         None => soap_fault("Could not detect ONVIF operation"),
@@ -247,12 +248,14 @@ fn options_xml(format: VideoFormat, stream: &Stream) -> String {
     )
 }
 
-fn service_capabilities() -> String {
-    r#"<tr2:GetServiceCapabilitiesResponse>
-  <tr2:Capabilities SnapshotUri="true" Rotation="false" VideoSourceMode="false" OSD="false">
+fn service_capabilities(config: &Config) -> String {
+    format!(
+        r#"<tr2:GetServiceCapabilitiesResponse>
+  <tr2:Capabilities SnapshotUri="{}" Rotation="false" VideoSourceMode="false" OSD="false">
     <tr2:ProfileCapabilities MaximumNumberOfProfiles="2" ConfigurationsSupported="VideoSource VideoEncoder"/>
     <tr2:StreamingCapabilities RTSPStreaming="true" RTPMulticast="false" RTP_RTSP_TCP="true" NonAggregateControl="false"/>
   </tr2:Capabilities>
-</tr2:GetServiceCapabilitiesResponse>"#
-        .to_string()
+</tr2:GetServiceCapabilitiesResponse>"#,
+        !config.no_snapshot
+    )
 }

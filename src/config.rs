@@ -51,6 +51,8 @@ pub struct Config {
     pub password: Option<String>,
     /// Disables the authentication that credentials otherwise turn on.
     pub no_auth: bool,
+    /// ONVIF reports snapshots as unsupported and `/snapshot.jpg` is not served.
+    pub no_snapshot: bool,
     pub overlay_text: Option<String>,
     pub overlay_font: Option<PathBuf>,
     pub overlay_font_size: u32,
@@ -381,6 +383,11 @@ struct Cli {
     #[arg(long = "no-auth")]
     no_auth: bool,
 
+    /// Behave like a camera without snapshots: `GetSnapshotUri` is not supported and
+    /// `/snapshot.jpg` returns 404.
+    #[arg(long = "no-snapshot")]
+    no_snapshot: bool,
+
     /// Text burned into the video. Defaults to the camera name.
     #[arg(long = "overlay-text")]
     overlay_text: Option<String>,
@@ -493,6 +500,7 @@ struct TomlCamera {
     username: Option<String>,
     password: Option<String>,
     auth: Option<bool>,
+    snapshot: Option<bool>,
     overlay_text: Option<String>,
     overlay_font: Option<PathBuf>,
     overlay_font_size: Option<u32>,
@@ -617,6 +625,7 @@ impl TryFrom<Cli> for Config {
             username: cli.username,
             password: cli.password,
             no_auth: cli.no_auth,
+            no_snapshot: cli.no_snapshot,
             overlay_text,
             overlay_font: if cli.no_overlay {
                 None
@@ -754,6 +763,7 @@ fn camera_from_toml(
         username,
         password,
         no_auth: !choose_copy(&camera.auth, &defaults.auth, true),
+        no_snapshot: !choose_copy(&camera.snapshot, &defaults.snapshot, true),
         overlay_text,
         overlay_font,
         overlay_font_size: validate_non_zero(
@@ -813,6 +823,7 @@ impl Default for Config {
             username: None,
             password: None,
             no_auth: false,
+            no_snapshot: false,
             overlay_text: Some("Fake ONVIF Camera".to_string()),
             overlay_font: default_overlay_font(),
             overlay_font_size: 32,

@@ -65,6 +65,9 @@ fn handle_client(mut stream: TcpStream, config: Arc<Config>) -> io::Result<()> {
             unauthorized_response()
         }
         ("GET", "/") => text_response(200, status_text(200), landing_text(&config)),
+        ("GET", "/snapshot.jpg") if config.no_snapshot => {
+            text_response(404, status_text(404), "not found\n".to_string())
+        }
         ("GET", "/snapshot.jpg") => binary_response(200, "image/jpeg", SNAPSHOT_JPEG),
         ("POST", "/onvif/device_service") => {
             soap_response_for(onvif::Service::Device, &request.body, &config)

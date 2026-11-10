@@ -111,6 +111,11 @@ pub fn detect_operation(xml: &str) -> Option<String> {
         "GetVideoSourceConfigurations",
         "GetVideoEncoderConfigurations",
         "GetVideoEncoderConfigurationOptions",
+        "GetCompatibleVideoEncoderConfigurations",
+        "GetMetadataConfigurations",
+        "GetAudioSources",
+        "GetAudioEncoderConfigurations",
+        "GetAudioSourceConfigurations",
         "GetServiceCapabilities",
         "SetSynchronizationPoint",
     ];
@@ -229,7 +234,20 @@ pub fn soap_response_for_service(
         Some("GetStreamUri") => requested_stream(config, request)
             .map(|(_, stream)| get_stream_uri(config, &stream))
             .unwrap_or_else(|reason| soap_fault(&reason)),
+        Some("GetSnapshotUri") if config.no_snapshot => action_not_supported_fault(),
         Some("GetSnapshotUri") => get_snapshot_uri(config),
+        // The camera has no audio and no metadata streams: empty lists, like logent's metadata.
+        Some("GetMetadataConfigurations") => "<trt:GetMetadataConfigurationsResponse/>".to_string(),
+        Some("GetAudioSources") => "<trt:GetAudioSourcesResponse/>".to_string(),
+        Some("GetAudioEncoderConfigurations") => {
+            "<trt:GetAudioEncoderConfigurationsResponse/>".to_string()
+        }
+        Some("GetAudioSourceConfigurations") => {
+            "<trt:GetAudioSourceConfigurationsResponse/>".to_string()
+        }
+        Some("GetCompatibleVideoEncoderConfigurations") => requested_stream(config, request)
+            .map(|_| get_compatible_video_encoder_configurations(config))
+            .unwrap_or_else(|reason| soap_fault(&reason)),
         Some("GetVideoSources") => get_video_sources(config),
         Some("GetVideoSourceConfigurations") => get_video_source_configurations(config),
         Some("GetVideoEncoderConfigurations") => get_video_encoder_configurations(config),
@@ -238,7 +256,7 @@ pub fn soap_response_for_service(
             .unwrap_or_else(|reason| soap_fault(&reason)),
         Some("GetServiceCapabilities") => match service {
             Service::Device => get_device_service_capabilities(config),
-            Service::Media => get_media_service_capabilities(),
+            Service::Media => get_media_service_capabilities(config),
         },
         Some("SetSynchronizationPoint") => "<trt:SetSynchronizationPointResponse/>".to_string(),
         Some(other) => soap_fault(&format!("Unsupported ONVIF operation: {other}")),
@@ -600,6 +618,25 @@ fn get_video_sources(config: &Config) -> String {
     )
 }
 
+/// Every video encoder configuration can be added to any (video-only) profile of this camera.
+fn get_compatible_video_encoder_configurations(config: &Config) -> String {
+    let configurations: Vec<String> = config
+        .streams()
+        .iter()
+        .enumerate()
+        .map(|(index, stream)| {
+            // In a list response the element is `trt:Configurations`, not `tt:VideoEncoderConfiguration`.
+            video_encoder_configuration_xml(index, stream)
+                .replace("tt:VideoEncoderConfiguration", "trt:Configurations")
+        })
+        .collect();
+
+    format!(
+        "<trt:GetCompatibleVideoEncoderConfigurationsResponse>\n  {}\n</trt:GetCompatibleVideoEncoderConfigurationsResponse>",
+        configurations.join("\n  ")
+    )
+}
+
 fn get_video_source_configurations(config: &Config) -> String {
     format!(
         r#"<trt:GetVideoSourceConfigurationsResponse>
@@ -715,13 +752,39 @@ fn get_video_encoder_configuration_options(stream: &Stream) -> String {
       </tt:EncodingIntervalRange>
       <tt:H264ProfilesSupported>Baseline</tt:H264ProfilesSupported>
     </tt:H264>
+    <tt:Extension>
+      <tt:H264>
+        <tt:ResolutionsAvailable>
+          <tt:Width>{0}</tt:Width>
+          <tt:Height>{1}</tt:Height>
+        </tt:ResolutionsAvailable>
+        <tt:GovLengthRange>
+          <tt:Min>{2}</tt:Min>
+          <tt:Max>{3}</tt:Max>
+        </tt:GovLengthRange>
+        <tt:FrameRateRange>
+          <tt:Min>1</tt:Min>
+          <tt:Max>{4}</tt:Max>
+        </tt:FrameRateRange>
+        <tt:EncodingIntervalRange>
+          <tt:Min>1</tt:Min>
+          <tt:Max>1</tt:Max>
+        </tt:EncodingIntervalRange>
+        <tt:H264ProfilesSupported>Baseline</tt:H264ProfilesSupported>
+        <tt:BitrateRange>
+          <tt:Min>1</tt:Min>
+          <tt:Max>{5}</tt:Max>
+        </tt:BitrateRange>
+      </tt:H264>
+    </tt:Extension>
   </trt:Options>
 </trt:GetVideoEncoderConfigurationOptionsResponse>"#,
         stream.width,
         stream.height,
         stream.fps,
         stream.fps * 4,
-        stream.fps
+        stream.fps,
+        bitrate_limit(stream)
     )
 }
 
@@ -741,14 +804,16 @@ fn get_device_service_capabilities(config: &Config) -> String {
 }
 
 /// Media service capabilities (trt).
-fn get_media_service_capabilities() -> String {
-    r#"<trt:GetServiceCapabilitiesResponse>
-  <trt:Capabilities SnapshotUri="true" Rotation="false" VideoSourceMode="false" OSD="false">
+fn get_media_service_capabilities(config: &Config) -> String {
+    format!(
+        r#"<trt:GetServiceCapabilitiesResponse>
+  <trt:Capabilities SnapshotUri="{}" Rotation="false" VideoSourceMode="false" OSD="false">
     <trt:ProfileCapabilities MaximumNumberOfProfiles="128"/>
     <trt:StreamingCapabilities RTPMulticast="false" RTP_TCP="true" RTP_RTSP_TCP="true" NonAggregateControl="false"/>
   </trt:Capabilities>
-</trt:GetServiceCapabilitiesResponse>"#
-        .to_string()
+</trt:GetServiceCapabilitiesResponse>"#,
+        !config.no_snapshot
+    )
 }
 
 /// Fault real cameras return for operations they do not implement.
@@ -1072,6 +1137,79 @@ mod tests {
 
         config.no_auth = true;
         assert!(capabilities(&config).contains(r#"UsernameToken="false""#));
+    }
+
+    fn media(op: &str, config: &Config, body: &str) -> String {
+        let request = format!("<trt:{op}>{body}</trt:{op}>");
+        let operation = detect_operation(&request);
+        assert_eq!(operation.as_deref(), Some(op));
+        soap_response_for_service(Service::Media, operation.as_deref(), config, &request)
+    }
+
+    #[test]
+    fn empty_audio_and_metadata_lists() {
+        let config = two_stream_config();
+        for (op, response) in [
+            (
+                "GetMetadataConfigurations",
+                "GetMetadataConfigurationsResponse",
+            ),
+            ("GetAudioSources", "GetAudioSourcesResponse"),
+            (
+                "GetAudioEncoderConfigurations",
+                "GetAudioEncoderConfigurationsResponse",
+            ),
+            (
+                "GetAudioSourceConfigurations",
+                "GetAudioSourceConfigurationsResponse",
+            ),
+        ] {
+            let xml = media(op, &config, "");
+            assert!(xml.contains(&format!("<trt:{response}/>")), "{op}");
+        }
+    }
+
+    #[test]
+    fn compatible_video_encoder_configurations_list_all_and_check_the_token() {
+        let config = two_stream_config();
+        let ok = media(
+            "GetCompatibleVideoEncoderConfigurations",
+            &config,
+            "<trt:ProfileToken>profile_2</trt:ProfileToken>",
+        );
+        assert!(ok.contains(r#"token="video_encoder_config_1""#));
+        assert!(ok.contains(r#"token="video_encoder_config_2""#));
+        assert!(ok.contains("<trt:Configurations token="));
+        assert!(!ok.contains("tt:VideoEncoderConfiguration"));
+
+        let bad = media(
+            "GetCompatibleVideoEncoderConfigurations",
+            &config,
+            "<trt:ProfileToken>nope</trt:ProfileToken>",
+        );
+        assert!(bad.contains("<s:Fault>"));
+    }
+
+    #[test]
+    fn encoder_options_carry_a_bitrate_range() {
+        let options = get_video_encoder_configuration_options(&two_stream_config().streams()[0]);
+        assert!(options.contains("<tt:Extension>"));
+        assert!(options.contains("<tt:BitrateRange>"));
+    }
+
+    #[test]
+    fn snapshots_can_be_switched_off() {
+        let mut config = two_stream_config();
+        let request = "<trt:GetSnapshotUri><trt:ProfileToken>profile_1</trt:ProfileToken></trt:GetSnapshotUri>";
+        let snapshot = |config: &Config| {
+            soap_response_for_service(Service::Media, Some("GetSnapshotUri"), config, request)
+        };
+        assert!(snapshot(&config).contains("/snapshot.jpg"));
+        assert!(get_media_service_capabilities(&config).contains(r#"SnapshotUri="true""#));
+
+        config.no_snapshot = true;
+        assert!(snapshot(&config).contains("ter:ActionNotSupported"));
+        assert!(get_media_service_capabilities(&config).contains(r#"SnapshotUri="false""#));
     }
 
     #[test]

@@ -286,3 +286,7 @@ Set `username` and `password` (CLI `--username`/`--password`, or TOML `[defaults
 - Without credentials nothing is checked, as before.
 
 This is a login check for NVR testing, not security: nonces are stateless, there is no TLS, and the password is stored in plain text.
+
+## Cameras without snapshots
+
+`--no-snapshot` (TOML `snapshot = false`) makes a camera behave like one that has no snapshot support: `GetSnapshotUri` (Media and Media2) returns `ter:ActionNotSupported`, the media capabilities report `SnapshotUri="false"`, and `/snapshot.jpg` returns 404. Use it to check that the NVR copes with a missing snapshot. By default the snapshot is the 1x1 stub image.

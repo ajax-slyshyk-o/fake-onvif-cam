@@ -633,6 +633,8 @@ struct TomlConfig {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 struct TomlCamera {
+    /// Expands this `[[cameras]]` entry into `count` cameras (see [`expand_cameras`]).
+    count: Option<u32>,
     name: Option<String>,
     uuid: Option<String>,
     http: Option<SocketAddr>,
@@ -818,14 +820,190 @@ pub fn load_from_toml(path: &Path) -> Result<Vec<Config>, String> {
     }
 
     let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut configs = Vec::with_capacity(parsed.cameras.len());
+    let cameras = expand_cameras(&parsed.defaults, &parsed.cameras)?;
+    let mut configs = Vec::with_capacity(cameras.len());
 
-    for (index, camera) in parsed.cameras.iter().enumerate() {
+    for (index, camera) in cameras.iter().enumerate() {
         configs.push(camera_from_toml(&parsed.defaults, camera, index, base_dir)?);
     }
 
     validate_fleet(&configs)?;
     Ok(configs)
+}
+
+/// Expands `[[cameras]]` entries with `count = N` into N cameras, so a group of identical cameras
+/// is one block instead of N.
+///
+/// - `{n}` is the camera's number in the file (1, 2, ... across all groups), `{i}` its number
+///   inside the group. A format may follow: `{n:02}` (zero padded), `{n:04x}` (hex). They work in
+///   `name`, `uuid`, `serial` and `overlay_text`, for single cameras too. Other braces stay as they are.
+/// - `http`, `rtsp_port` and `rtp_port` are the values of the group's first camera; the next
+///   cameras get +1, +1 and +2 (RTP and RTCP). Without them a camera continues after the
+///   previous one, starting at 8000 / 8554 / 5004.
+/// - In a group (`count > 1`) a `name` without `{n}` / `{i}` gets ` {n:02}` appended, `uuid` must
+///   contain a placeholder (every camera needs its own), and a missing `name`, `uuid` or `serial`
+///   gets a numbered default.
+fn expand_cameras(
+    defaults: &TomlCamera,
+    cameras: &[TomlCamera],
+) -> Result<Vec<TomlCamera>, String> {
+    if defaults.count.is_some() {
+        return Err("count is not allowed in [defaults]".to_string());
+    }
+
+    let default_http = defaults.http;
+    let mut next_http = default_http.map_or(8000, |addr| addr.port());
+    let mut next_rtsp = 8554_u16;
+    let mut next_rtp = 5004_u16;
+    let mut expanded: Vec<TomlCamera> = Vec::new();
+
+    for (group, camera) in cameras.iter().enumerate() {
+        let count = camera.count.unwrap_or(1);
+        if count == 0 {
+            return Err(format!("[[cameras]] entry {}: count must be at least 1", group + 1));
+        }
+        let grouped = count > 1;
+
+        let http = camera.http.or(defaults.http);
+        let ip = http.map_or_else(|| "0.0.0.0".parse().expect("valid ip"), |addr| addr.ip());
+        let first_http = http.map_or(next_http, |addr| addr.port());
+        let first_rtsp = camera.rtsp_port.or(defaults.rtsp_port).unwrap_or(next_rtsp);
+        let first_rtp = camera.rtp_port.or(defaults.rtp_port).unwrap_or(next_rtp);
+
+        for i in 0..count {
+            let n = expanded.len() + 1;
+            let ports = |first: u16, step: u32| {
+                u32::from(first)
+                    .checked_add(i * step)
+                    .and_then(|port| u16::try_from(port).ok())
+                    .ok_or_else(|| {
+                        format!(
+                            "[[cameras]] entry {}: ports run out of range at camera {n}",
+                            group + 1
+                        )
+                    })
+            };
+
+            let mut resolved = camera.clone();
+            resolved.count = None;
+            resolved.http = Some(SocketAddr::new(ip, ports(first_http, 1)?));
+            resolved.rtsp_port = Some(ports(first_rtsp, 1)?);
+            resolved.rtp_port = Some(ports(first_rtp, 2)?);
+
+            let mut name = camera.name.clone().or_else(|| defaults.name.clone());
+            if grouped {
+                name = Some(match name {
+                    Some(name) if has_placeholder(&name) => name,
+                    Some(name) => format!("{name} {{n:02}}"),
+                    None => "Fake ONVIF Camera {n:02}".to_string(),
+                });
+            }
+            resolved.name = name.map(|value| expand_template(&value, n, i as usize + 1));
+
+            let uuid = camera.uuid.clone().or_else(|| defaults.uuid.clone());
+            resolved.uuid = match uuid {
+                Some(value) if grouped && !has_placeholder(&value) => {
+                    return Err(format!(
+                        "[[cameras]] entry {}: uuid \"{value}\" is the same for all {count} cameras; add {{n}}, e.g. \"...{{n:04x}}\"",
+                        group + 1
+                    ));
+                }
+                Some(value) => Some(expand_template(&value, n, i as usize + 1)),
+                None if grouped => Some(expand_template(
+                    "00000000-0000-4550-98a8-98a80cab{n:04x}",
+                    n,
+                    i as usize + 1,
+                )),
+                None => None,
+            };
+
+            let serial = camera.serial.clone().or_else(|| defaults.serial.clone());
+            resolved.serial = match serial {
+                Some(value) => Some(expand_template(&value, n, i as usize + 1)),
+                None if grouped => Some(expand_template("FAKE-ONVIF-{n:03}", n, i as usize + 1)),
+                None => None,
+            };
+
+            resolved.overlay_text = camera
+                .overlay_text
+                .clone()
+                .or_else(|| defaults.overlay_text.clone())
+                .map(|value| expand_template(&value, n, i as usize + 1));
+
+            expanded.push(resolved);
+        }
+
+        next_http = ports_after(first_http, count, 1);
+        next_rtsp = ports_after(first_rtsp, count, 1);
+        next_rtp = ports_after(first_rtp, count, 2);
+    }
+
+    Ok(expanded)
+}
+
+/// First port after a run of `count` cameras that started at `first` (saturating, so an
+/// overflow surfaces as the "ports run out of range" error of the next camera).
+fn ports_after(first: u16, count: u32, step: u32) -> u16 {
+    u16::try_from(u32::from(first) + count * step).unwrap_or(u16::MAX)
+}
+
+fn has_placeholder(template: &str) -> bool {
+    expand_template(template, 1, 1) != expand_template(template, 2, 2)
+}
+
+/// Replaces `{n}` / `{i}` (with an optional `:0W` / `:0Wx` style format) in `template`.
+/// Anything that is not a valid placeholder is kept as it is.
+fn expand_template(template: &str, n: usize, i: usize) -> String {
+    let mut out = String::new();
+    let mut rest = template;
+
+    while let Some(start) = rest.find('{') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('}') else {
+            out.push('{');
+            rest = after;
+            continue;
+        };
+
+        match format_placeholder(&after[..end], n, i) {
+            Some(text) => {
+                out.push_str(&text);
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push('{');
+                rest = after;
+            }
+        }
+    }
+
+    out.push_str(rest);
+    out
+}
+
+/// `n`, `i`, `n:02`, `n:x`, `i:04x`: variable, then optional `0` padding, width and `x` (hex).
+fn format_placeholder(inner: &str, n: usize, i: usize) -> Option<String> {
+    let (variable, spec) = inner.split_once(':').unwrap_or((inner, ""));
+    let value = match variable {
+        "n" => n,
+        "i" => i,
+        _ => return None,
+    };
+
+    let (spec, hex) = match spec.strip_suffix('x') {
+        Some(spec) => (spec, true),
+        None => (spec, false),
+    };
+    let zero = spec.starts_with('0');
+    let width: usize = if spec.is_empty() { 0 } else { spec.parse().ok()? };
+
+    Some(match (hex, zero) {
+        (true, true) => format!("{value:0width$x}"),
+        (true, false) => format!("{value:width$x}"),
+        (false, true) => format!("{value:0width$}"),
+        (false, false) => format!("{value:width$}"),
+    })
 }
 
 fn camera_from_toml(
@@ -1456,5 +1634,89 @@ mod tests {
         assert!(Naming::parse("onvif")
             .unwrap_err()
             .contains("default or logent"));
+    }
+
+    fn expand(body: &str) -> Result<Vec<TomlCamera>, String> {
+        let config: TomlConfig = toml::from_str(body).unwrap();
+        expand_cameras(&config.defaults, &config.cameras)
+    }
+
+    #[test]
+    fn templates_support_padding_and_hex() {
+        assert_eq!(expand_template("Cam {n} / {i}", 3, 1), "Cam 3 / 1");
+        assert_eq!(expand_template("{n:02}-{n:03}", 7, 1), "07-007");
+        assert_eq!(expand_template("{n:x} {n:04x} {n:4}", 255, 1), "ff 00ff  255");
+        assert_eq!(expand_template("{x} {n:q} { {n} {n", 1, 1), "{x} {n:q} { 1 {n");
+        assert!(has_placeholder("a{i}"));
+        assert!(!has_placeholder("a-b"));
+    }
+
+    #[test]
+    fn group_expands_names_serials_uuids_and_ports() {
+        let cameras = expand(
+            "[[cameras]]\ncount = 3\nname = \"Cam {n:02}\"\nuuid = \"u-{n}\"\nserial = \"S{i}\"\n\
+             http = \"0.0.0.0:8100\"\nrtsp_port = 8600\nrtp_port = 6000\n",
+        )
+        .unwrap();
+
+        assert_eq!(cameras.len(), 3);
+        let names: Vec<_> = cameras.iter().map(|c| c.name.clone().unwrap()).collect();
+        assert_eq!(names, ["Cam 01", "Cam 02", "Cam 03"]);
+        assert_eq!(cameras[2].uuid.as_deref(), Some("u-3"));
+        assert_eq!(cameras[2].serial.as_deref(), Some("S3"));
+        assert_eq!(cameras[2].http.unwrap().port(), 8102);
+        assert_eq!(cameras[2].rtsp_port, Some(8602));
+        assert_eq!(cameras[2].rtp_port, Some(6004));
+        assert!(cameras.iter().all(|c| c.count.is_none()));
+    }
+
+    #[test]
+    fn groups_continue_ports_and_numbering() {
+        let cameras = expand(
+            "[[cameras]]\nname = \"Solo\"\n\
+             [[cameras]]\ncount = 2\nname = \"Grp\"\n\
+             [[cameras]]\ncount = 2\nhttp = \"0.0.0.0:9000\"\nname = \"Far {n}\"\nuuid = \"f{n}\"\n",
+        )
+        .unwrap();
+
+        let http: Vec<_> = cameras.iter().map(|c| c.http.unwrap().port()).collect();
+        assert_eq!(http, [8000, 8001, 8002, 9000, 9001]);
+        let rtsp: Vec<_> = cameras.iter().map(|c| c.rtsp_port.unwrap()).collect();
+        assert_eq!(rtsp, [8554, 8555, 8556, 8557, 8558]);
+        let rtp: Vec<_> = cameras.iter().map(|c| c.rtp_port.unwrap()).collect();
+        assert_eq!(rtp, [5004, 5006, 5008, 5010, 5012]);
+
+        // a name without a placeholder gets the number appended in a group, not for a single camera
+        assert_eq!(cameras[0].name.as_deref(), Some("Solo"));
+        assert_eq!(cameras[1].name.as_deref(), Some("Grp 02"));
+        assert_eq!(cameras[4].name.as_deref(), Some("Far 5"));
+        // defaults for a group without uuid / serial
+        assert_eq!(
+            cameras[1].uuid.as_deref(),
+            Some("00000000-0000-4550-98a8-98a80cab0002")
+        );
+        assert_eq!(cameras[2].serial.as_deref(), Some("FAKE-ONVIF-003"));
+        assert_eq!(cameras[0].uuid, None, "a single camera keeps the generated uuid");
+    }
+
+    #[test]
+    fn group_errors() {
+        let same_uuid = expand("[[cameras]]\ncount = 2\nuuid = \"fixed\"\n").unwrap_err();
+        assert!(same_uuid.contains("same for all 2"), "{same_uuid}");
+        assert!(expand("[[cameras]]\ncount = 0\n").is_err());
+        assert!(expand("[defaults]\ncount = 2\n[[cameras]]\n").is_err());
+        assert!(expand("[[cameras]]\ncount = 3\nrtp_port = 65532\n")
+            .unwrap_err()
+            .contains("out of range"));
+    }
+
+    #[test]
+    fn defaults_are_templated_too() {
+        let cameras = expand(
+            "[defaults]\noverlay_text = \"cam {n}\"\nserial = \"SN{n}\"\n[[cameras]]\ncount = 2\n",
+        )
+        .unwrap();
+        assert_eq!(cameras[1].overlay_text.as_deref(), Some("cam 2"));
+        assert_eq!(cameras[1].serial.as_deref(), Some("SN2"));
     }
 }

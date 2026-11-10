@@ -104,6 +104,8 @@ rtsp_port = 8555
 rtp_port = 5006
 ```
 
+A `[[cameras]]` block with `count = N` expands to N cameras (`expand_cameras` in `config.rs`): `{n}` / `{i}` placeholders in `name`, `uuid`, `serial` and `overlay_text`, ports counted up from the first camera (see README, "Groups of identical cameras").
+
 Fleet validation rejects duplicate ports or UUIDs across cameras.
 
 ## Runtime Requirements

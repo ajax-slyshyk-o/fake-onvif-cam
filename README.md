@@ -192,6 +192,37 @@ Each camera can set its own `file`. If omitted, it uses `[defaults].file`; if bo
 
 All options available on the command line can also be set in the TOML `[defaults]` block or per `[[cameras]]` entry.
 
+### Groups of identical cameras (`count`)
+
+A `[[cameras]]` block with `count = N` becomes N cameras, so two or more typical configurations are two blocks instead of N copies. Everything else in the block (codec, file, sub stream, ...) is shared by the group.
+
+```toml
+[[cameras]]
+count = 8
+name = "Fake Camera {n:02}"
+uuid = "00000000-0000-4550-98a8-98a80cab{n:04x}"
+serial = "FAKE-ONVIF-{n:03}"
+overlay_text = "Fake Camera {n:02}"
+http = "0.0.0.0:8000"
+rtsp_port = 8554
+rtp_port = 5004
+codec = "h264_nvenc"      # first 8: GPU
+
+[[cameras]]
+count = 8                 # next 8: ports continue, codec from [defaults]
+name = "Fake Camera {n:02}"
+uuid = "00000000-0000-4550-98a8-98a80cab{n:04x}"
+serial = "FAKE-ONVIF-{n:03}"
+overlay_text = "Fake Camera {n:02}"
+```
+
+- `{n}` is the camera number in the whole file (1..16 above), `{i}` the number inside its group. `{n:02}` pads with zeros and `{n:04x}` is hex. They work in `name`, `uuid`, `serial` and `overlay_text`, also in `[defaults]` and for single cameras. Anything else in braces is left as it is.
+- Ports: `http`, `rtsp_port` and `rtp_port` are the values for the group's first camera; the next ones get +1, +1 and +2 (RTP and RTCP). Without them a camera continues after the previous one (starting at 8000, 8554 and 5004). Fleet validation still rejects clashes.
+- In a group, a `name` without a placeholder gets ` {n:02}` appended, and a missing `uuid` or `serial` becomes `00000000-0000-4550-98a8-98a80cab{n:04x}` and `FAKE-ONVIF-{n:03}`. A fixed `uuid` is an error, because every camera needs its own.
+- `count` is not allowed in `[defaults]`. `--export-cameras` shows the expanded list.
+
+`configs/cameras-16-hw-sub-groups.toml` is `cameras-16-hw-sub.toml` written as two groups; the cameras are the same except for the uuids.
+
 ### CPU load with many cameras
 
 Every camera runs its own ffmpeg encode, so the load grows linearly with the camera count. Sixteen 1080p30 `libx264 veryfast` streams can saturate a desktop CPU, and 4K is about four times heavier per stream. To reduce it, lower the resolution and fps (with `scale = true`), use `preset = "ultrafast"`, or move cameras to a hardware encoder. `codec` and `preset` can be set per camera, so encoders can be mixed.
@@ -203,6 +234,7 @@ Ready-made examples in the repository (`configs/`):
 | `configs/cameras-8.toml` | 8 cameras, `libx264` |
 | `configs/cameras-16.toml` | 16 cameras, `libx264` |
 | `configs/cameras-16-hw.toml` | 16 cameras at 4000 kbit/s: 01-08 on `h264_nvenc` (GPU), 09-16 on `libx264 ultrafast` (CPU), to stay under the NVENC session limit |
+| `configs/cameras-16-hw-sub-groups.toml` | 16 cameras with a sub stream, as two `count = 8` groups (GPU and CPU encode) |
 
 ## Useful options
 

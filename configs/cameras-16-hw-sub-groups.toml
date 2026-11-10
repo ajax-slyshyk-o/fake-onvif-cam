@@ -1,0 +1,56 @@
+[defaults]
+advertise_host = "10.42.0.44"
+ffmpeg = "d:/bin/ffmpeg-8.1-full_build/bin/ffmpeg.exe"
+# Fallback media file. A camera can override this with its own file entry.
+file = "d:/Projects/AJAX/video/Kyiv1080.mp4"
+width = 1920
+height = 1080
+fps = 30
+scale = false
+manufacturer = "Codex Labs"
+model = "FakeCam Rust"
+overlay_font_size = 32
+bitrate = 4000
+# Encoder: the first group overrides this with h264_nvenc (GPU); the second uses
+# light software x264.
+codec = "libx264"
+preset = "ultrafast"
+
+# Sub stream for every camera: /live_sub, 426x240, 512k, software x264, RTP port = rtp_port + 1000.
+# The NVR can use it for live grids instead of decoding the 1080p main stream.
+sub_stream = true
+sub_fps = 20
+sub_bitrate = 256
+sub_codec = "libx265"
+sub_preset = "ultrafast"
+sub_width = 320
+#sub_height = 576
+
+# Same cameras as cameras-16-hw-sub.toml, written as two groups. `count` expands a block into
+# N cameras: {n} is the camera number in the file (1..16), {i} the number inside the group.
+# Ports are the first camera's value; the next cameras get http +1, rtsp +1, rtp +2.
+# The uuids differ from cameras-16-hw-sub.toml (generated from {n}), so an NVR that stored
+# the old cameras sees new ones.
+
+# Cameras 01-08: GPU encode (NVENC session limit applies)
+[[cameras]]
+count = 8
+name = "Fake Camera {n:02}"
+uuid = "00000000-0000-4550-98a8-98a80cab{n:04x}"
+serial = "FAKE-ONVIF-{n:03}"
+overlay_text = "Fake Camera {n:02}"
+http = "0.0.0.0:8000"
+rtsp_port = 8554
+rtsp_path = "live"
+rtp_port = 5004
+codec = "h264_nvenc"
+preset = "p2"
+
+# Cameras 09-16: software x264 from the defaults; the ports continue after the first group
+[[cameras]]
+count = 8
+name = "Fake Camera {n:02}"
+uuid = "00000000-0000-4550-98a8-98a80cab{n:04x}"
+serial = "FAKE-ONVIF-{n:03}"
+overlay_text = "Fake Camera {n:02}"
+rtsp_path = "live"

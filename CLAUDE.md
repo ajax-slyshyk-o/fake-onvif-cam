@@ -17,7 +17,7 @@ cargo build --release
 cargo run -- --advertise-host 192.168.1.50
 
 # Run from config file (multi-camera)
-cargo run -- --config cameras.toml
+cargo run -- --config configs/cameras.toml
 
 # Run without ffmpeg (ONVIF endpoints only, no video)
 cargo run -- --advertise-host 192.168.1.50 --no-ffmpeg
@@ -74,7 +74,7 @@ With `sub_stream = true` a camera has two streams (`Config::streams()`: main fir
 - **Authentication is opt-in.** With both `username` and `password` set (and no `--no-auth` / `auth = false`) the SOAP endpoints require WS-Security UsernameToken or HTTP Digest, and RTSP requires Digest (`auth.rs`). Discovery-style operations (`GetServices`, `GetCapabilities`, `GetDeviceInformation`, `GetSystemDateAndTime`, `GetScopes`, `GetServiceCapabilities`, `GetWsdlUrl`) stay open. Without credentials everything is unauthenticated. Nonces are stateless, so it is a login check, not a security boundary.
 - **Snapshot is a stub.** `/snapshot.jpg` returns a hardcoded 1×1 JPEG byte array, not a real frame.
 
-## Configuration File (cameras.toml)
+## Configuration File (configs/cameras.toml)
 
 ```toml
 [defaults]

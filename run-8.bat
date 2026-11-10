@@ -2,7 +2,7 @@
 SET LOGFILE=%~dp0run-8.log
 
 :loop
-"%~dp0target\release\fake-onvif-cam.exe" --config "%~dp0cameras-8.toml"
+"%~dp0target\release\fake-onvif-cam.exe" --config "%~dp0configs\cameras-8.toml"
 SET EXIT_CODE=%errorlevel%
 
 IF %EXIT_CODE% EQU 0 goto :done

@@ -185,7 +185,7 @@ fps = 15
 Then run:
 
 ```powershell
-cargo run -- --config cameras.toml
+cargo run -- --config configs/cameras.toml
 ```
 
 Each camera can set its own `file`. If omitted, it uses `[defaults].file`; if both are omitted, that camera uses the generated test pattern. Each camera needs unique HTTP, RTSP, RTP, and RTCP ports. The RTCP port is always `rtp_port + 1`.
@@ -196,13 +196,13 @@ All options available on the command line can also be set in the TOML `[defaults
 
 Every camera runs its own ffmpeg encode, so the load grows linearly with the camera count. Sixteen 1080p30 `libx264 veryfast` streams can saturate a desktop CPU, and 4K is about four times heavier per stream. To reduce it, lower the resolution and fps (with `scale = true`), use `preset = "ultrafast"`, or move cameras to a hardware encoder. `codec` and `preset` can be set per camera, so encoders can be mixed.
 
-Ready-made examples in the repository:
+Ready-made examples in the repository (`configs/`):
 
 | File | Contents |
 |------|----------|
-| `cameras-8.toml` | 8 cameras, `libx264` |
-| `cameras-16.toml` | 16 cameras, `libx264` |
-| `cameras-16-hw.toml` | 16 cameras at 4000 kbit/s: 01-08 on `h264_nvenc` (GPU), 09-16 on `libx264 ultrafast` (CPU), to stay under the NVENC session limit |
+| `configs/cameras-8.toml` | 8 cameras, `libx264` |
+| `configs/cameras-16.toml` | 16 cameras, `libx264` |
+| `configs/cameras-16-hw.toml` | 16 cameras at 4000 kbit/s: 01-08 on `h264_nvenc` (GPU), 09-16 on `libx264 ultrafast` (CPU), to stay under the NVENC session limit |
 
 ## Useful options
 
@@ -240,7 +240,7 @@ Ready-made examples in the repository:
 `--export-cameras` prints the resolved camera list (name, UUID, advertise host, HTTP port, plus `username`/`password` when configured) as JSON and exits without starting any services. Other tools can use it to register the fake cameras elsewhere:
 
 ```powershell
-cargo run -- --config cameras.toml --export-cameras cameras.json
+cargo run -- --config configs/cameras.toml --export-cameras cameras.json
 ```
 
 `username` / `password` (CLI `--username`/`--password`, or TOML `[defaults]` with per-camera override) are also exported for provisioning. See [Authentication](#authentication).

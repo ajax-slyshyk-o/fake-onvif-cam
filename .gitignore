@@ -4,6 +4,6 @@
 .env
 .DS_Store
 Thumbs.db
-cameras.toml
+configs/cameras.toml
 *.bat
 *.zip

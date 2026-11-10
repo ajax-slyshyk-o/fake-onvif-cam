@@ -13,6 +13,9 @@ use std::time::Duration;
 
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Packets queued per TCP client before it counts as too slow (about 5 s of a 4 Mbit/s stream).
+const CLIENT_QUEUE_PACKETS: usize = 2048;
+
 type Clients = Arc<Mutex<Vec<Client>>>;
 
 pub struct RtspServerGuard {
@@ -34,6 +37,9 @@ impl Drop for RtspServerGuard {
 struct Client {
     id: u64,
     playing: Arc<AtomicBool>,
+    /// Set while this client cannot keep up (its TCP queue overflowed): video packets are
+    /// dropped until the next keyframe, so what it receives next is decodable again.
+    lagging: Arc<AtomicBool>,
     sink: ClientSink,
 }
 
@@ -122,13 +128,20 @@ pub fn spawn_source(config: &Config) -> io::Result<Source> {
     let mut tracks = Vec::new();
 
     for stream in config.streams() {
-        let video = spawn_track(stream.name, stream.rtp_port, &stop, &mut workers)?;
+        let video = spawn_track(
+            stream.name,
+            stream.rtp_port,
+            Some(stream.format()),
+            &stop,
+            &mut workers,
+        )?;
         let audio = stream
             .audio
             .map(|audio| {
                 spawn_track(
                     &format!("{}-audio", stream.name),
                     audio.rtp_port,
+                    None,
                     &stop,
                     &mut workers,
                 )
@@ -187,6 +200,7 @@ pub fn spawn(config: Arc<Config>, source: &Source) -> io::Result<RtspServerGuard
 fn spawn_track(
     name: &str,
     rtp_port: u16,
+    format: Option<VideoFormat>,
     stop: &Arc<AtomicBool>,
     workers: &mut Vec<JoinHandle<()>>,
 ) -> io::Result<TrackRelay> {
@@ -202,6 +216,7 @@ fn spawn_track(
         clients.clone(),
         stop.clone(),
         false,
+        format,
     )?);
     workers.push(spawn_relay_loop(
         &format!("rtcp-relay-{name}"),
@@ -209,6 +224,7 @@ fn spawn_track(
         clients.clone(),
         stop.clone(),
         true,
+        format,
     )?);
 
     Ok(TrackRelay {
@@ -260,14 +276,22 @@ fn spawn_relay_loop(
     clients: Clients,
     stop: Arc<AtomicBool>,
     is_rtcp: bool,
+    format: Option<VideoFormat>,
 ) -> io::Result<JoinHandle<()>> {
     thread::Builder::new()
         .name(name.to_string())
-        .spawn(move || relay_loop(socket, clients, stop, is_rtcp))
+        .spawn(move || relay_loop(socket, clients, stop, is_rtcp, format))
 }
 
-fn relay_loop(socket: Arc<UdpSocket>, clients: Clients, stop: Arc<AtomicBool>, is_rtcp: bool) {
+fn relay_loop(
+    socket: Arc<UdpSocket>,
+    clients: Clients,
+    stop: Arc<AtomicBool>,
+    is_rtcp: bool,
+    format: Option<VideoFormat>,
+) {
     let mut buffer = vec![0_u8; 65_536];
+    let port = socket.local_addr().map_or(0, |addr| addr.port());
 
     while !stop.load(Ordering::Relaxed) {
         let length = match socket.recv_from(&mut buffer) {
@@ -284,14 +308,26 @@ fn relay_loop(socket: Arc<UdpSocket>, clients: Clients, stop: Arc<AtomicBool>, i
             }
         };
 
-        let failed_clients = broadcast_packet(&clients, &buffer[..length], is_rtcp);
+        let failed_clients = broadcast_packet(&clients, &buffer[..length], is_rtcp, port, format);
         if !failed_clients.is_empty() {
             remove_clients(&clients, &failed_clients);
         }
     }
 }
 
-fn broadcast_packet(clients: &Clients, packet: &[u8], is_rtcp: bool) -> Vec<u64> {
+/// Sends one packet from ffmpeg to every playing client and returns the clients that are gone.
+///
+/// A TCP client that reads too slowly (its queue is full) is not dropped, because it would just
+/// sit on an open connection without data until the NVR's watchdog notices. Like a real camera
+/// under congestion it loses packets instead: for video everything up to the next keyframe, so
+/// that what arrives afterwards decodes again.
+fn broadcast_packet(
+    clients: &Clients,
+    packet: &[u8],
+    is_rtcp: bool,
+    track_port: u16,
+    format: Option<VideoFormat>,
+) -> Vec<u64> {
     let snapshot = match clients.lock() {
         Ok(clients) => clients.clone(),
         Err(_) => return Vec::new(),
@@ -309,22 +345,37 @@ fn broadcast_packet(clients: &Clients, packet: &[u8], is_rtcp: bool) -> Vec<u64>
                 rtp_channel,
                 rtcp_channel,
             } => {
+                let video = format.filter(|_| !is_rtcp);
+                let lagging = client.lagging.load(Ordering::Relaxed);
+                if lagging && !video.is_some_and(|format| starts_keyframe(format, packet)) {
+                    continue;
+                }
+
                 let channel = if is_rtcp { *rtcp_channel } else { *rtp_channel };
-                packet_tx
-                    .try_send(TcpPacket {
-                        channel,
-                        data: packet.to_vec(),
-                    })
-                    .map_err(|err| match err {
-                        TrySendError::Full(_) => io::Error::new(
-                            io::ErrorKind::WouldBlock,
-                            "RTSP client packet queue full",
-                        ),
-                        TrySendError::Disconnected(_) => io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "RTSP client packet writer disconnected",
-                        ),
-                    })
+                match packet_tx.try_send(TcpPacket {
+                    channel,
+                    data: packet.to_vec(),
+                }) {
+                    Ok(()) => {
+                        if lagging {
+                            client.lagging.store(false, Ordering::Relaxed);
+                        }
+                        Ok(())
+                    }
+                    Err(TrySendError::Full(_)) => {
+                        if video.is_some() && !client.lagging.swap(true, Ordering::Relaxed) {
+                            eprintln!(
+                                "rtsp: client {} of track port {track_port} is not reading fast enough; dropping video until the next keyframe",
+                                client.id
+                            );
+                        }
+                        Ok(())
+                    }
+                    Err(TrySendError::Disconnected(_)) => Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "RTSP client packet writer disconnected",
+                    )),
+                }
             }
             ClientSink::Udp {
                 rtp_socket,
@@ -338,7 +389,11 @@ fn broadcast_packet(clients: &Clients, packet: &[u8], is_rtcp: bool) -> Vec<u64>
             }
         };
 
-        if result.is_err() {
+        if let Err(err) = result {
+            eprintln!(
+                "rtsp: dropping client {} of track port {track_port}: {err}",
+                client.id
+            );
             failed.push(client.id);
         }
     }
@@ -362,6 +417,7 @@ fn handle_client(
     let session = util::make_uuid();
     let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
     let playing = Arc::new(AtomicBool::new(false));
+    let lagging = Arc::new(AtomicBool::new(false));
     // Stream this connection is subscribed to (index into `relays`), set by SETUP, and which
     // of its tracks were set up.
     let mut subscribed: Option<usize> = None;
@@ -462,6 +518,7 @@ fn handle_client(
                     Client {
                         id: client_id,
                         playing: playing.clone(),
+                        lagging: lagging.clone(),
                         sink,
                     },
                 );
@@ -586,13 +643,16 @@ fn setup_transport(
         || transport.to_ascii_lowercase().contains("interleaved")
     {
         let (rtp_channel, rtcp_channel) = parse_interleaved(transport).unwrap_or(default_channels);
-        let (packet_tx, packet_rx) = mpsc::sync_channel::<TcpPacket>(4096);
+        let (packet_tx, packet_rx) = mpsc::sync_channel::<TcpPacket>(CLIENT_QUEUE_PACKETS);
         let packet_writer = writer.clone();
         let _ = thread::Builder::new()
             .name("rtsp-tcp-writer".to_string())
             .spawn(move || {
                 while let Ok(packet) = packet_rx.recv() {
-                    if write_interleaved(&packet_writer, packet.channel, &packet.data).is_err() {
+                    if let Err(err) =
+                        write_interleaved(&packet_writer, packet.channel, &packet.data)
+                    {
+                        eprintln!("rtsp: writing to client {peer} failed: {err}");
                         break;
                     }
                 }
@@ -728,6 +788,68 @@ fn lock_stream(writer: &Arc<Mutex<TcpStream>>) -> io::Result<std::sync::MutexGua
     writer
         .lock()
         .map_err(|_| io::Error::other("RTSP stream lock poisoned"))
+}
+
+/// True when `packet` (an RTP packet of a video stream) begins a keyframe: an IDR picture or
+/// the parameter sets sent in front of one (also inside an aggregation packet or as the first
+/// fragment of a fragmented NAL unit).
+fn starts_keyframe(format: VideoFormat, packet: &[u8]) -> bool {
+    let Some(&first) = packet.first() else {
+        return false;
+    };
+    let csrc = usize::from(first & 0x0f) * 4;
+    let mut start = 12 + csrc;
+    if first & 0x10 != 0 {
+        // header extension: 16-bit profile, 16-bit length in 32-bit words
+        let Some(length) = packet.get(start + 2..start + 4) else {
+            return false;
+        };
+        start += 4 + usize::from(u16::from_be_bytes([length[0], length[1]])) * 4;
+    }
+    let Some(payload) = packet.get(start..).filter(|payload| payload.len() >= 2) else {
+        return false;
+    };
+
+    match format {
+        VideoFormat::H264 => {
+            let key = |nal: u8| matches!(nal & 0x1f, 5 | 7);
+            match payload[0] & 0x1f {
+                // STAP-A: 16-bit size and NAL unit, repeated
+                24 => aggregated_units(&payload[1..], |unit| key(unit[0])),
+                // FU-A: start bit in the FU header, NAL type in its low bits
+                28 => payload[1] & 0x80 != 0 && key(payload[1]),
+                nal => key(nal),
+            }
+        }
+        VideoFormat::H265 => {
+            // VPS/SPS/PPS (32 to 34) and IRAP pictures (16 to 21)
+            let key = |nal: u8| matches!(nal, 16..=21 | 32..=34);
+            match (payload[0] >> 1) & 0x3f {
+                // aggregation packet: 16-bit size and NAL unit (with its 2-byte header)
+                48 => aggregated_units(&payload[2..], |unit| {
+                    unit.len() >= 2 && key((unit[0] >> 1) & 0x3f)
+                }),
+                // FU: start bit in the FU header, NAL type in its low bits
+                49 => payload.len() >= 3 && payload[2] & 0x80 != 0 && key(payload[2] & 0x3f),
+                nal => key(nal),
+            }
+        }
+    }
+}
+
+/// Whether any unit of an aggregation packet body (`size, unit` pairs) satisfies `matches`.
+fn aggregated_units(mut body: &[u8], matches: impl Fn(&[u8]) -> bool) -> bool {
+    while body.len() > 2 {
+        let size = usize::from(u16::from_be_bytes([body[0], body[1]]));
+        let Some(unit) = body.get(2..2 + size).filter(|unit| !unit.is_empty()) else {
+            return false;
+        };
+        if matches(unit) {
+            return true;
+        }
+        body = &body[2 + size..];
+    }
+    false
 }
 
 fn replace_client(clients: &Clients, client: Client) {
@@ -937,5 +1059,123 @@ mod tests {
             find_stream(&[relay("live", 1)], "rtsp://h:1/whatever"),
             Some(0)
         );
+    }
+
+    fn rtp(payload: &[u8]) -> Vec<u8> {
+        let mut packet = vec![0x80, 96, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1];
+        packet.extend_from_slice(payload);
+        packet
+    }
+
+    #[test]
+    fn finds_h264_keyframe_starts() {
+        let h264 = VideoFormat::H264;
+        assert!(starts_keyframe(h264, &rtp(&[0x65, 1, 2]))); // IDR slice
+        assert!(starts_keyframe(h264, &rtp(&[0x67, 1, 2]))); // SPS
+        assert!(!starts_keyframe(h264, &rtp(&[0x41, 1, 2]))); // P slice
+        assert!(starts_keyframe(h264, &rtp(&[0x7c, 0x85, 1]))); // FU-A start of IDR
+        assert!(!starts_keyframe(h264, &rtp(&[0x7c, 0x05, 1]))); // FU-A continuation of IDR
+        assert!(!starts_keyframe(h264, &rtp(&[0x5c, 0x81, 1]))); // FU-A start of a P slice
+                                                                 // STAP-A with SPS and PPS
+        assert!(starts_keyframe(
+            h264,
+            &rtp(&[24, 0, 2, 0x67, 1, 0, 2, 0x68, 2])
+        ));
+        // STAP-A with only a P slice
+        assert!(!starts_keyframe(h264, &rtp(&[24, 0, 2, 0x41, 1])));
+        assert!(!starts_keyframe(h264, &[]) && !starts_keyframe(h264, &rtp(&[])));
+    }
+
+    #[test]
+    fn finds_h265_keyframe_starts() {
+        let h265 = VideoFormat::H265;
+        assert!(starts_keyframe(h265, &rtp(&[0x40, 1, 1]))); // VPS (32)
+        assert!(starts_keyframe(h265, &rtp(&[0x26, 1, 1]))); // IDR_W_RADL (19)
+        assert!(!starts_keyframe(h265, &rtp(&[0x02, 1, 1]))); // TRAIL_R (1)
+        assert!(starts_keyframe(h265, &rtp(&[0x62, 1, 0x93]))); // FU start of IDR (19)
+        assert!(!starts_keyframe(h265, &rtp(&[0x62, 1, 0x13]))); // FU continuation
+                                                                 // aggregation packet with a VPS
+        assert!(starts_keyframe(h265, &rtp(&[0x60, 1, 0, 3, 0x40, 1, 9])));
+    }
+
+    #[test]
+    fn rtp_header_with_csrc_and_extension_is_skipped() {
+        let mut packet = vec![0x91, 96, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1];
+        packet.extend_from_slice(&[0, 0, 0, 0]); // one CSRC
+        packet.extend_from_slice(&[0xbe, 0xde, 0, 1, 9, 9, 9, 9]); // extension, one word
+        packet.extend_from_slice(&[0x65, 1]);
+        assert!(starts_keyframe(VideoFormat::H264, &packet));
+    }
+
+    fn tcp_client(id: u64, capacity: usize) -> (Client, mpsc::Receiver<TcpPacket>) {
+        let (packet_tx, packet_rx) = mpsc::sync_channel(capacity);
+        let client = Client {
+            id,
+            playing: Arc::new(AtomicBool::new(true)),
+            lagging: Arc::new(AtomicBool::new(false)),
+            sink: ClientSink::Tcp {
+                packet_tx,
+                rtp_channel: 0,
+                rtcp_channel: 1,
+            },
+        };
+        (client, packet_rx)
+    }
+
+    #[test]
+    fn a_client_that_cannot_keep_up_keeps_its_connection_and_resumes_at_a_keyframe() {
+        let clients: Clients = Arc::new(Mutex::new(Vec::new()));
+        let (client, rx) = tcp_client(7, 2);
+        let lagging = client.lagging.clone();
+        clients.lock().unwrap().push(client);
+        let send = |payload: &[u8]| {
+            broadcast_packet(
+                &clients,
+                &rtp(payload),
+                false,
+                5004,
+                Some(VideoFormat::H264),
+            )
+        };
+        let queued = || std::iter::from_fn(|| rx.try_recv().ok()).count();
+
+        assert!(send(&[0x65, 1]).is_empty());
+        assert!(send(&[0x41, 1]).is_empty());
+        // the queue (2) is full: the packet is lost, the client stays and starts lagging
+        assert!(send(&[0x41, 2]).is_empty());
+        assert!(lagging.load(Ordering::Relaxed));
+        assert_eq!(clients.lock().unwrap().len(), 1);
+
+        // the client reads again, but P slices are still skipped until a keyframe
+        assert_eq!(queued(), 2);
+        assert!(send(&[0x41, 3]).is_empty());
+        assert_eq!(queued(), 0);
+        assert!(lagging.load(Ordering::Relaxed));
+
+        // keyframe: delivery resumes
+        assert!(send(&[0x67, 1]).is_empty());
+        assert!(!lagging.load(Ordering::Relaxed));
+        assert!(send(&[0x41, 4]).is_empty());
+        assert_eq!(queued(), 2);
+
+        // a client whose writer is gone is reported
+        drop(rx);
+        assert_eq!(send(&[0x41, 5]), vec![7]);
+    }
+
+    #[test]
+    fn audio_and_rtcp_overflow_only_drop_the_packet() {
+        let clients: Clients = Arc::new(Mutex::new(Vec::new()));
+        let (client, _rx) = tcp_client(1, 1);
+        let lagging = client.lagging.clone();
+        clients.lock().unwrap().push(client);
+
+        assert!(broadcast_packet(&clients, &rtp(&[1]), false, 7004, None).is_empty());
+        assert!(broadcast_packet(&clients, &rtp(&[2]), false, 7004, None).is_empty());
+        assert!(
+            broadcast_packet(&clients, &[0x80, 200], true, 7005, Some(VideoFormat::H264))
+                .is_empty()
+        );
+        assert!(!lagging.load(Ordering::Relaxed), "only video lags");
     }
 }

@@ -10,6 +10,9 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1.0"
 ctrlc = "3.5"
+md-5 = "0.11"
+sha1 = "0.11"
+base64 = "0.23"
 
 [build-dependencies]
 git-version = "0.3"

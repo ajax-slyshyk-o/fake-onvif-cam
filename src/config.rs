@@ -49,6 +49,8 @@ pub struct Config {
     /// ONVIF credentials; only exported for NVR provisioning, never checked.
     pub username: Option<String>,
     pub password: Option<String>,
+    /// Disables the authentication that credentials otherwise turn on.
+    pub no_auth: bool,
     pub overlay_text: Option<String>,
     pub overlay_font: Option<PathBuf>,
     pub overlay_font_size: u32,
@@ -114,12 +116,32 @@ impl Stream {
 }
 
 impl Config {
+    /// Login required by ONVIF and RTSP: `Some` only when both credentials are set and
+    /// authentication was not switched off.
+    pub fn auth_credentials(&self) -> Option<(&str, &str)> {
+        if self.no_auth {
+            return None;
+        }
+        Some((self.username.as_deref()?, self.password.as_deref()?))
+    }
+
     /// True when any stream of this camera is published as H.265.
     pub fn has_hevc(&self) -> bool {
         self.streams()
             .iter()
             .any(|stream| stream.format() == VideoFormat::H265)
     }
+}
+
+/// `username` and `password` only make sense together.
+fn validate_credentials(
+    username: &Option<String>,
+    password: &Option<String>,
+) -> Result<(), String> {
+    if username.is_some() != password.is_some() {
+        return Err("username and password must be set together".to_string());
+    }
+    Ok(())
 }
 
 /// HEVC is only wired up for sub streams for now: the main stream stays H.264.
@@ -331,13 +353,17 @@ struct Cli {
     #[arg(long = "serial", default_value = "FAKE-ONVIF-001")]
     serial: String,
 
-    /// ONVIF username written to the exported camera list (not enforced).
+    /// ONVIF/RTSP username. With `--password` it also turns authentication on.
     #[arg(long = "username")]
     username: Option<String>,
 
-    /// ONVIF password written to the exported camera list (not enforced).
+    /// ONVIF/RTSP password. With `--username` it also turns authentication on.
     #[arg(long = "password")]
     password: Option<String>,
+
+    /// Export the credentials but do not require a login (ONVIF and RTSP stay open).
+    #[arg(long = "no-auth")]
+    no_auth: bool,
 
     /// Text burned into the video. Defaults to the camera name.
     #[arg(long = "overlay-text")]
@@ -445,6 +471,7 @@ struct TomlCamera {
     serial: Option<String>,
     username: Option<String>,
     password: Option<String>,
+    auth: Option<bool>,
     overlay_text: Option<String>,
     overlay_font: Option<PathBuf>,
     overlay_font_size: Option<u32>,
@@ -539,6 +566,8 @@ impl TryFrom<Cli> for Config {
                 .or_else(|| Some(cli.camera_name.clone()))
         };
 
+        validate_credentials(&cli.username, &cli.password)?;
+
         Ok(Self {
             camera_name: cli.camera_name,
             uuid: cli.uuid.unwrap_or_else(util::make_uuid),
@@ -564,6 +593,7 @@ impl TryFrom<Cli> for Config {
             serial: cli.serial,
             username: cli.username,
             password: cli.password,
+            no_auth: cli.no_auth,
             overlay_text,
             overlay_font: if cli.no_overlay {
                 None
@@ -661,6 +691,11 @@ fn camera_from_toml(
             .or_else(default_overlay_font)
     };
 
+    let username = choose_optional_string(&camera.username, &defaults.username);
+    let password = choose_optional_string(&camera.password, &defaults.password);
+    validate_credentials(&username, &password)
+        .map_err(|err| format!("camera {}: {err}", index + 1))?;
+
     Ok(Config {
         camera_name: name,
         uuid,
@@ -691,8 +726,9 @@ fn camera_from_toml(
             env!("CARGO_PKG_VERSION"),
         ),
         serial: choose_string(&camera.serial, &defaults.serial, "FAKE-ONVIF-001"),
-        username: choose_optional_string(&camera.username, &defaults.username),
-        password: choose_optional_string(&camera.password, &defaults.password),
+        username,
+        password,
+        no_auth: !choose_copy(&camera.auth, &defaults.auth, true),
         overlay_text,
         overlay_font,
         overlay_font_size: validate_non_zero(
@@ -745,6 +781,7 @@ impl Default for Config {
             serial: "FAKE-ONVIF-001".to_string(),
             username: None,
             password: None,
+            no_auth: false,
             overlay_text: Some("Fake ONVIF Camera".to_string()),
             overlay_font: default_overlay_font(),
             overlay_font_size: 32,

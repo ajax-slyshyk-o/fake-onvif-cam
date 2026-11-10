@@ -63,6 +63,7 @@ With `sub_stream = true` a camera has two streams (`Config::streams()`: main fir
 | `rtsp.rs` | Custom RTSP server + RTP/RTCP relay; supports both TCP-interleaved and UDP-unicast transport |
 | `ffmpeg.rs` | Spawns/supervises ffmpeg subprocess; builds drawtext filter for overlay; handles platform fonts |
 | `export.rs` | `--export-cameras`: writes the resolved camera list as JSON and exits |
+| `auth.rs` | Optional login check: WS-Security UsernameToken, HTTP Digest (SOAP) and RTSP Digest |
 | `util.rs` | UUID v4 generation, XML/JSON escaping, UTC timestamp helpers |
 
 ## Key Design Decisions
@@ -70,7 +71,7 @@ With `sub_stream = true` a camera has two streams (`Config::streams()`: main fir
 - **No async.** Each connection/service gets its own OS thread. The RTSP client list (`Arc<Mutex<Vec<Client>>>`) is shared across the relay and accept threads.
 - **No streaming library.** RTP/RTCP framing is hand-rolled in `rtsp.rs`.
 - **ffmpeg as encoder.** Video never passes through Rust — ffmpeg writes RTP packets to a local UDP socket, the relay picks them up and forwards to RTSP clients.
-- **No ONVIF authentication.** All SOAP endpoints are unauthenticated (by design for testing).
+- **Authentication is opt-in.** With both `username` and `password` set (and no `--no-auth` / `auth = false`) the SOAP endpoints require WS-Security UsernameToken or HTTP Digest, and RTSP requires Digest (`auth.rs`). Discovery-style operations (`GetServices`, `GetCapabilities`, `GetDeviceInformation`, `GetSystemDateAndTime`, `GetScopes`, `GetServiceCapabilities`, `GetWsdlUrl`) stay open. Without credentials everything is unauthenticated. Nonces are stateless, so it is a login check, not a security boundary.
 - **Snapshot is a stub.** `/snapshot.jpg` returns a hardcoded 1×1 JPEG byte array, not a real frame.
 
 ## Configuration File (cameras.toml)

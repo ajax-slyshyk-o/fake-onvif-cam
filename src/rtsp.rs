@@ -1,3 +1,4 @@
+use crate::auth;
 use crate::config::{Config, Stream, VideoFormat};
 use crate::onvif;
 use crate::util;
@@ -279,6 +280,21 @@ fn handle_client(
 
     while let Some(request) = read_request(&mut reader)? {
         let cseq = request.cseq();
+
+        // Everything except OPTIONS needs a login when the camera has credentials.
+        if request.method != "OPTIONS"
+            && !auth::check_rtsp(&config, request.header("Authorization"), &request.method)
+        {
+            write_response(
+                &writer,
+                401,
+                "Unauthorized",
+                &cseq,
+                &[("WWW-Authenticate", auth::digest_challenge())],
+                &[],
+            )?;
+            continue;
+        }
 
         match request.method.as_str() {
             "OPTIONS" => write_response(

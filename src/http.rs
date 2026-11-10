@@ -1,3 +1,4 @@
+use crate::auth;
 use crate::config::Config;
 use crate::onvif;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -22,6 +23,7 @@ const SNAPSHOT_JPEG: &[u8] = &[
 struct Request {
     method: String,
     path: String,
+    authorization: Option<String>,
     body: String,
 }
 
@@ -57,6 +59,11 @@ fn handle_client(mut stream: TcpStream, config: Arc<Config>) -> io::Result<()> {
     let path = request.path.split('?').next().unwrap_or(&request.path);
 
     let response = match (request.method.as_str(), path) {
+        ("POST", "/onvif/device_service" | "/onvif/media_service" | "/onvif/media2_service")
+            if !is_authorized(&request, &config) =>
+        {
+            unauthorized_response()
+        }
         ("GET", "/") => text_response(200, status_text(200), landing_text(&config)),
         ("GET", "/snapshot.jpg") => binary_response(200, "image/jpeg", SNAPSHOT_JPEG),
         ("POST", "/onvif/device_service") => {
@@ -104,6 +111,7 @@ fn read_request(stream: &TcpStream) -> io::Result<Request> {
         .to_string();
 
     let mut content_length = 0_usize;
+    let mut authorization = None;
     loop {
         let mut line = String::new();
         let read = reader.read_line(&mut line)?;
@@ -114,6 +122,8 @@ fn read_request(stream: &TcpStream) -> io::Result<Request> {
         if let Some((name, value)) = line.split_once(':') {
             if name.eq_ignore_ascii_case("content-length") {
                 content_length = value.trim().parse().unwrap_or(0);
+            } else if name.eq_ignore_ascii_case("authorization") {
+                authorization = Some(value.trim().to_string());
             }
         }
     }
@@ -126,8 +136,45 @@ fn read_request(stream: &TcpStream) -> io::Result<Request> {
     Ok(Request {
         method,
         path,
+        authorization,
         body: String::from_utf8_lossy(&body_bytes).to_string(),
     })
+}
+
+/// Open operations (discovery, clock sync, ...) need no login; everything else does when the
+/// camera has credentials.
+fn is_authorized(request: &Request, config: &Config) -> bool {
+    config.auth_credentials().is_none()
+        || auth::is_open_operation(onvif::detect_operation(&request.body).as_deref())
+        || auth::check_soap(
+            config,
+            &request.body,
+            request.authorization.as_deref(),
+            &request.method,
+        )
+}
+
+fn unauthorized_response() -> Vec<u8> {
+    let fault = r#"<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:ter="http://www.onvif.org/ver10/error">
+  <s:Body>
+    <s:Fault>
+      <s:Code>
+        <s:Value>s:Sender</s:Value>
+        <s:Subcode><s:Value>ter:NotAuthorized</s:Value></s:Subcode>
+      </s:Code>
+      <s:Reason><s:Text xml:lang="en">Sender not authorized</s:Text></s:Reason>
+    </s:Fault>
+  </s:Body>
+</s:Envelope>"#;
+    let mut response = format!(
+        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: {}\r\nContent-Type: application/soap+xml; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        auth::digest_challenge(),
+        fault.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(fault.as_bytes());
+    response
 }
 
 fn soap_response_for(service: onvif::Service, body: &str, config: &Config) -> Vec<u8> {

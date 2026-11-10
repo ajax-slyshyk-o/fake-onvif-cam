@@ -227,7 +227,7 @@ Ready-made examples in the repository:
 cargo run -- --config cameras.toml --export-cameras cameras.json
 ```
 
-`username` / `password` (CLI `--username`/`--password`, or TOML `[defaults]` with per-camera override) are only exported for provisioning; the emulator never checks them.
+`username` / `password` (CLI `--username`/`--password`, or TOML `[defaults]` with per-camera override) are also exported for provisioning. See [Authentication](#authentication).
 
 ```json
 {
@@ -258,3 +258,15 @@ Then confirm the RTSP stream directly:
 ```powershell
 ffplay rtsp://<advertise-host>:8554/live
 ```
+
+## Authentication
+
+Set `username` and `password` (CLI `--username`/`--password`, or TOML `[defaults]` with per-camera override; both are required together) and the camera asks for a login, like a real one:
+
+- ONVIF SOAP (`/onvif/*_service`): WS-Security `UsernameToken` (password digest or text) in the SOAP header, or HTTP Digest. Failures get `401` with a `WWW-Authenticate: Digest` challenge and a `ter:NotAuthorized` fault.
+- RTSP: Digest on every request except `OPTIONS`, e.g. `rtsp://admin:admin123@host:8554/live`.
+- Open without a login: `GetServices`, `GetServiceCapabilities`, `GetCapabilities`, `GetDeviceInformation`, `GetSystemDateAndTime`, `GetScopes`, `GetWsdlUrl`. The device `GetServiceCapabilities` reports `UsernameToken`/`HttpDigest` as `true`.
+- `--no-auth` (TOML `auth = false`) keeps the credentials for `--export-cameras` but does not require a login.
+- Without credentials nothing is checked, as before.
+
+This is a login check for NVR testing, not security: nonces are stateless, there is no TLS, and the password is stored in plain text.

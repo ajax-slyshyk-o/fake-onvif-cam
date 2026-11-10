@@ -237,7 +237,7 @@ pub fn soap_response_for_service(
             .map(|(_, stream)| get_video_encoder_configuration_options(&stream))
             .unwrap_or_else(|reason| soap_fault(&reason)),
         Some("GetServiceCapabilities") => match service {
-            Service::Device => get_device_service_capabilities(),
+            Service::Device => get_device_service_capabilities(config),
             Service::Media => get_media_service_capabilities(),
         },
         Some("SetSynchronizationPoint") => "<trt:SetSynchronizationPointResponse/>".to_string(),
@@ -725,16 +725,19 @@ fn get_video_encoder_configuration_options(stream: &Stream) -> String {
     )
 }
 
-/// Device service capabilities (tds). No authentication or TLS is implemented.
-fn get_device_service_capabilities() -> String {
-    r#"<tds:GetServiceCapabilitiesResponse>
+/// Device service capabilities (tds). TLS is not implemented.
+fn get_device_service_capabilities(config: &Config) -> String {
+    let auth = config.auth_credentials().is_some();
+
+    format!(
+        r#"<tds:GetServiceCapabilitiesResponse>
   <tds:Capabilities>
     <tds:Network IPFilter="false" ZeroConfiguration="false" IPVersion6="false" DynDNS="false"/>
-    <tds:Security TLS1.0="false" TLS1.1="false" TLS1.2="false" UsernameToken="false" HttpDigest="false"/>
+    <tds:Security TLS1.0="false" TLS1.1="false" TLS1.2="false" UsernameToken="{auth}" HttpDigest="{auth}"/>
     <tds:System DiscoveryResolve="false" DiscoveryBye="false" RemoteDiscovery="false" SystemLogging="false" FirmwareUpgrade="false"/>
   </tds:Capabilities>
 </tds:GetServiceCapabilitiesResponse>"#
-        .to_string()
+    )
 }
 
 /// Media service capabilities (trt).
@@ -1046,6 +1049,28 @@ mod tests {
                 "{op}"
             );
         }
+    }
+
+    #[test]
+    fn device_capabilities_announce_authentication() {
+        let mut config = two_stream_config();
+        let request = "<tds:GetServiceCapabilities/>";
+        let capabilities = |config: &Config| {
+            soap_response_for_service(
+                Service::Device,
+                Some("GetServiceCapabilities"),
+                config,
+                request,
+            )
+        };
+        assert!(capabilities(&config).contains(r#"UsernameToken="false" HttpDigest="false""#));
+
+        config.username = Some("admin".to_string());
+        config.password = Some("admin123".to_string());
+        assert!(capabilities(&config).contains(r#"UsernameToken="true" HttpDigest="true""#));
+
+        config.no_auth = true;
+        assert!(capabilities(&config).contains(r#"UsernameToken="false""#));
     }
 
     #[test]
